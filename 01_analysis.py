@@ -23,8 +23,17 @@ if hasattr(sys.stdout, "reconfigure"):
 # === Config ===
 # =============================================================================
 
-DATA_DIR = Path("data")
-VIZ_DIR = Path("viz")
+# Resolve paths relative to this script's location so the script works
+# both from the project root and from a git worktree subdirectory.
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Walk up from SCRIPT_DIR to find the data/ folder (handles worktree layout)
+DATA_DIR = next(
+    (p / "data" for p in [SCRIPT_DIR, *SCRIPT_DIR.parents] if (p / "data").exists()),
+    SCRIPT_DIR / "data",  # fallback — will produce a clear FileNotFoundError
+)
+
+VIZ_DIR = SCRIPT_DIR / "viz"
 VIZ_DIR.mkdir(exist_ok=True)
 
 EXPECTED_DATE_MIN = pd.Timestamp("2023-01-09")
@@ -856,6 +865,16 @@ print(f"  Implied annualized rate:         {ann_logo_churn:.1f}%")
 print(f"  Min: {logo_churn_df['logo_churn_rate_pct'].min():.2f}%  "
       f"Max: {logo_churn_df['logo_churn_rate_pct'].max():.2f}%")
 
+# Dec 2024 shows 68.8% monthly churn (106/154 accounts) — end_date cluster on
+# Dec 26-31, 2024 confirms this is a planned pilot shutdown, not organic attrition.
+# Operational metric = ex-Dec figure; with-Dec disclosed for transparency.
+logo_excl = logo_churn_df[logo_churn_df["month"] != pd.Period("2024-12", "M")]
+avg_logo_excl    = logo_excl["logo_churn_rate_pct"].mean()
+ann_logo_excl    = (1 - (1 - avg_logo_excl / 100) ** 12) * 100
+print(f"\n  Excluding Dec 2024 (end-of-pilot wind-down):")
+print(f"  Avg monthly logo churn (ex-Dec):  {avg_logo_excl:.2f}%")
+print(f"  Implied annualized (ex-Dec):      {ann_logo_excl:.1f}%")
+
 # =============================================================================
 # --- 3.4 Revenue churn rate ---
 # Denominator: total active MRR at start of month M (= total_mrr in panel,
@@ -919,6 +938,56 @@ plt.close()
 print(f"\n  Chart saved: viz/metrics_02_churn_rates.png")
 
 # =============================================================================
+# --- 3.4b Revised revenue churn rate (account-level methodology) ---
+# Phase 1 finding: subscription churn_flag is incomplete — only 110 accounts
+# flagged vs 339 with churn_events. Original 0.90% avg was understated.
+# Revised method: for each churn event (non-reactivation), join to the
+# churned account's total active subscription MRR at the churn month from the
+# monthly panel. This captures the full revenue impact per churned account.
+# =============================================================================
+
+rev_churn_acct_mrr = (
+    churn_events[churn_events["is_reactivation"] == False]
+    .assign(churn_month=lambda df: df["churn_date"].dt.to_period("M"))
+    [["account_id", "churn_month"]]
+    .merge(
+        acct_monthly_mrr.rename(columns={"month": "churn_month"}),
+        on=["account_id", "churn_month"],
+        how="left",
+    )
+    .fillna({"mrr": 0})
+    .groupby("churn_month")["mrr"]
+    .sum()
+    .rename("churned_acct_mrr")
+)
+
+rev_churn_rev_records = []
+for _, row in decomp.iterrows():
+    m         = row["month"]
+    start_mrr = row["total_mrr"]
+    c_mrr     = float(rev_churn_acct_mrr.get(m, 0))
+    rev_churn_rev_records.append({
+        "month":             m,
+        "starting_mrr":      int(start_mrr),
+        "churned_mrr_acct":  int(c_mrr),
+        "rev_churn_rev_pct": round(c_mrr / start_mrr * 100, 2) if start_mrr > 0 else np.nan,
+    })
+
+rev_churn_rev_df  = pd.DataFrame(rev_churn_rev_records)
+avg_rev_churn_rev = rev_churn_rev_df["rev_churn_rev_pct"].mean()
+rev_excl          = rev_churn_rev_df[rev_churn_rev_df["month"] != pd.Period("2024-12", "M")]
+avg_rev_churn_rev_excl = rev_excl["rev_churn_rev_pct"].mean()
+
+print(f"\n{'-' * 60}")
+print("3.4b REVISED REVENUE CHURN RATE (account-level, from churn_events)")
+print(f"{'-' * 60}")
+print(rev_churn_rev_df[["month", "starting_mrr", "churned_mrr_acct", "rev_churn_rev_pct"]]
+      .to_string(index=False))
+print(f"\n  Avg monthly rev churn (with Dec 2024): {avg_rev_churn_rev:.2f}%")
+print(f"  Avg monthly rev churn (excl. Dec):     {avg_rev_churn_rev_excl:.2f}%")
+print(f"  Original sub-level avg: 0.90%. Revised captures full account MRR impact.")
+
+# =============================================================================
 # --- 3.5 NRR and GRR (12-month rolling) ---
 # For each starting month M in 2023 (so that M+12 falls within the dataset):
 #   NRR(M) = sum(account MRR at M+12) / sum(account MRR at M) × 100
@@ -928,6 +997,9 @@ print(f"\n  Chart saved: viz/metrics_02_churn_rates.png")
 
 print(f"\n{'-' * 60}")
 print("3.5 NRR AND GRR (12-month rolling)")
+print(f"  NRR DEPRECATED — accounts average 8-10 concurrent active subscriptions,")
+print(f"  inflating NRR to 335% median (subscription accumulation, not expansion).")
+print(f"  GRR (97.8%) is the reliable retention metric. NRR limited to limitations.")
 print(f"{'-' * 60}")
 
 nrr_records = []
@@ -1061,12 +1133,16 @@ print(f"  MRR Jan 2023:                ${mrr_start:>12,.0f}")
 print(f"  MRR Dec 2024:                ${mrr_end:>12,.0f}")
 print(f"  MRR change over period:      {mrr_growth_pct:>+.1f}%")
 print()
-print(f"  Avg monthly logo churn:      {avg_logo_churn:>8.2f}%")
-print(f"  Implied annualized:          {ann_logo_churn:>8.1f}%")
-print(f"  Avg monthly rev churn:       {avg_rev_churn:>8.2f}%")
+print(f"  Avg monthly logo churn (incl. Dec 2024):  {avg_logo_churn:>8.2f}%  [ann. {ann_logo_churn:.1f}%]")
+print(f"  Avg monthly logo churn (ex.  Dec 2024):   {avg_logo_excl:>8.2f}%  [ann. {ann_logo_excl:.1f}%]  <- operational metric")
+print(f"  Note: Dec 2024 excluded from ex-Dec figure (pilot shutdown, not organic attrition)")
 print()
-print(f"  12-month NRR (median):       {nrr_df['nrr_pct'].median():>8.1f}%")
-print(f"  12-month GRR (median):       {nrr_df['grr_pct'].median():>8.1f}%")
+print(f"  Avg monthly rev churn — original (subs churn_flag):  {avg_rev_churn:>6.2f}%  [understated]")
+print(f"  Avg monthly rev churn — revised  (churn_events MRR): {avg_rev_churn_rev:>6.2f}%  <- methodology corrected")
+print(f"  Avg monthly rev churn — revised, ex-Dec 2024:        {avg_rev_churn_rev_excl:>6.2f}%  <- operational metric")
+print()
+print(f"  NRR (median): DEPRECATED — concurrent subscription model inflates to ~335%")
+print(f"  12-month GRR (median):       {nrr_df['grr_pct'].median():>8.1f}%  (reliable metric; benchmark: 80-90%)")
 print()
 print(f"  Aggregate cohort retention:")
 for k, v in agg_retention.items():
@@ -1078,7 +1154,591 @@ print(f"\n  Ready to proceed to Phase 4 (sub-question analysis): PENDING REVIEW"
 print(f"{'=' * 70}\n")
 
 # =============================================================================
-# === Phase 4: Analysis (mapped to SQ1–SQ9) ===
+# === Phase 4: Analysis (SQ1–SQ7) ===
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("PHASE 4 — SUB-QUESTION ANALYSIS (SQ1–SQ7)")
+print("=" * 70)
+
+# -----------------------------------------------------------------------------
+# SQ1: How has MRR evolved over the pilot period, and what plan tiers drive it?
+# -----------------------------------------------------------------------------
+print("\n--- SQ1: MRR trend by plan tier ---")
+
+# Build monthly MRR by plan tier
+# mrr_panel already carries plan_tier (pulled from subs_paid at build time)
+tier_monthly = (
+    mrr_panel
+    .groupby(["month", "plan_tier"])["mrr_amount"]
+    .sum()
+    .reset_index()
+)
+
+# Exclude Dec 2024 (pilot shutdown) from trend analysis per scoping decision
+# month column is Period[M] — compare with Period, not Timestamp
+tier_monthly_excl = tier_monthly[tier_monthly["month"] < pd.Period("2024-12", "M")]
+
+# Pivot for stacked area chart
+tier_pivot = tier_monthly_excl.pivot(index="month", columns="plan_tier", values="mrr_amount").fillna(0)
+
+fig, axes = plt.subplots(2, 1, figsize=(13, 10))
+
+# Top: stacked area by tier
+# Actual tier values in data: Enterprise, Pro, Basic (confirmed from subscriptions)
+tier_colors = {"Enterprise": "#1a3a5c", "Pro": "#2878b5", "Basic": "#9ecae1"}
+tier_order = [t for t in ["Enterprise", "Pro", "Basic"] if t in tier_pivot.columns]
+tier_pivot[tier_order].plot(
+    kind="area", stacked=True, ax=axes[0],
+    color=[tier_colors.get(t, "#cccccc") for t in tier_order], alpha=0.85
+)
+axes[0].set_title("Monthly MRR by Plan Tier (Jan 2023 – Nov 2024, ex-Dec 2024 pilot shutdown)", fontsize=13)
+axes[0].set_xlabel("")
+axes[0].set_ylabel("MRR ($)")
+axes[0].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+axes[0].legend(title="Plan Tier", loc="upper left")
+
+# Bottom: total MRR line (ex-Dec) with annotation of growth direction
+monthly_totals_excl = tier_monthly_excl.groupby("month")["mrr_amount"].sum()
+# Convert Period index to Timestamp for matplotlib compatibility
+_tot_idx = monthly_totals_excl.index.to_timestamp()
+axes[1].plot(_tot_idx, monthly_totals_excl.values, color="#1a3a5c", linewidth=2)
+axes[1].fill_between(_tot_idx, monthly_totals_excl.values, alpha=0.15, color="#2878b5")
+axes[1].set_title("Total MRR Trend (ex-Dec 2024)", fontsize=12)
+axes[1].set_xlabel("Month")
+axes[1].set_ylabel("Total MRR ($)")
+axes[1].yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "sq1_mrr_by_tier.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("  Chart saved: sq1_mrr_by_tier.png")
+
+# SQ1 key metrics
+mrr_jan23 = monthly_totals_excl.iloc[0]
+mrr_nov24 = monthly_totals_excl.iloc[-1]
+mrr_peak = monthly_totals_excl.max()
+mrr_peak_month = monthly_totals_excl.idxmax().strftime("%b %Y")
+
+# Tier share at end of period
+tier_end = tier_pivot.iloc[-1]
+tier_share_end = (tier_end / tier_end.sum() * 100).round(1)
+
+print(f"  MRR Jan 2023:    ${mrr_jan23:>10,.0f}")
+print(f"  MRR Nov 2024:    ${mrr_nov24:>10,.0f}")
+print(f"  Peak MRR:        ${mrr_peak:>10,.0f}  ({mrr_peak_month})")
+print(f"  Tier share at end of period (ex-Dec):")
+for tier in tier_order:
+    if tier in tier_share_end.index:
+        print(f"    {tier:<14}: {tier_share_end[tier]:.1f}%")
+
+# -----------------------------------------------------------------------------
+# SQ2: Which cohorts retain best and worst?
+# -----------------------------------------------------------------------------
+print("\n--- SQ2: Cohort retention analysis ---")
+
+# cohort_ret already computed in Phase 3
+# Identify best and worst cohort by M6 retention (enough data for most cohorts)
+if "M6" in cohort_ret.columns:
+    m6_ret = cohort_ret["M6"].dropna()
+    if len(m6_ret) >= 2:
+        best_cohort_m6 = m6_ret.idxmax()
+        worst_cohort_m6 = m6_ret.idxmin()
+        print(f"  Best M6 retention cohort:   {best_cohort_m6.strftime('%b %Y')}  ({m6_ret[best_cohort_m6]:.1f}%)")
+        print(f"  Worst M6 retention cohort:  {worst_cohort_m6.strftime('%b %Y')}  ({m6_ret[worst_cohort_m6]:.1f}%)")
+
+# Aggregate retention curve (already in agg_retention from Phase 3)
+print(f"  Aggregate retention curve:")
+for k, v in agg_retention.items():
+    bar = "#" * int(v / 5) if pd.notna(v) else ""
+    display = f"{v:.1f}%  {bar}" if pd.notna(v) else "N/A"
+    print(f"    {k:>4}: {display}")
+
+# M1 drop is the critical early-churn signal (per Phase 2 finding: churned median tenure 2.7 months)
+m1 = agg_retention.get("M1", None)
+m0 = agg_retention.get("M0", 100.0)
+if m1 is not None and pd.notna(m1):
+    m1_drop = m0 - m1
+    print(f"  M0→M1 drop: {m1_drop:.1f} pp  (early churn is the dominant driver)")
+
+# -----------------------------------------------------------------------------
+# SQ3: How does churn rate vary by segment (plan tier, industry, referral source, seats)?
+# -----------------------------------------------------------------------------
+print("\n--- SQ3: Churn segmentation ---")
+
+# Minimum segment size: 20 accounts (scoping doc rule)
+MIN_SEG = 20
+
+# acct is a filtered copy of accounts — it already carries all accounts columns
+# (industry, referral_source, seats, plan_tier, etc.) — no merge needed
+seg_base = acct.copy()
+
+def churn_rate_by(df, col):
+    """Return churn rate per category; suppress categories below MIN_SEG."""
+    grp = df.groupby(col).agg(
+        total=("account_id", "count"),
+        churned=("is_churned", "sum")
+    ).reset_index()
+    grp["churn_rate_pct"] = (grp["churned"] / grp["total"] * 100).round(1)
+    grp["reported"] = grp["total"] >= MIN_SEG
+    return grp.sort_values("churn_rate_pct", ascending=False)
+
+seg_tier = churn_rate_by(seg_base, "plan_tier")
+seg_industry = churn_rate_by(seg_base, "industry")
+seg_referral = churn_rate_by(seg_base, "referral_source")
+
+# Seats: bucket into bands
+seg_base["seats_band"] = pd.cut(seg_base["seats"], bins=[0, 5, 10, 25, 50, 999],
+                                 labels=["1-5", "6-10", "11-25", "26-50", "51+"])
+seg_seats = churn_rate_by(seg_base, "seats_band")
+
+print("\n  By plan tier (all segments reportable):")
+for _, row in seg_tier.iterrows():
+    flag = "" if row["reported"] else "  [< 20 accounts — count only]"
+    rate_str = f"{row['churn_rate_pct']:.1f}%" if row["reported"] else "N/A"
+    print(f"    {row['plan_tier']:<14}: {rate_str:>6}  (n={row['total']}){flag}")
+
+print("\n  By industry (top 5 by churn rate, min 20 accounts):")
+for _, row in seg_industry[seg_industry["reported"]].head(5).iterrows():
+    print(f"    {row['industry']:<20}: {row['churn_rate_pct']:.1f}%  (n={row['total']})")
+
+print("\n  By referral source (min 20 accounts):")
+for _, row in seg_referral[seg_referral["reported"]].iterrows():
+    print(f"    {row['referral_source']:<20}: {row['churn_rate_pct']:.1f}%  (n={row['total']})")
+
+print("\n  By seats band (min 20 accounts):")
+for _, row in seg_seats[seg_seats["reported"]].iterrows():
+    print(f"    {row['seats_band']:<10}: {row['churn_rate_pct']:.1f}%  (n={row['total']})")
+
+# Chart: churn rate by plan tier and by top industries (side by side)
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+seg_tier_plot = seg_tier[seg_tier["reported"]].sort_values("churn_rate_pct", ascending=True)
+axes[0].barh(seg_tier_plot["plan_tier"], seg_tier_plot["churn_rate_pct"], color="#2878b5")
+axes[0].set_title("Churn Rate by Plan Tier", fontsize=12)
+axes[0].set_xlabel("Churn Rate (%)")
+for i, (_, row) in enumerate(seg_tier_plot.iterrows()):
+    axes[0].text(row["churn_rate_pct"] + 0.5, i, f"{row['churn_rate_pct']:.1f}%  n={row['total']}", va="center", fontsize=9)
+axes[0].set_xlim(0, seg_tier_plot["churn_rate_pct"].max() * 1.25)
+
+seg_ind_plot = seg_industry[seg_industry["reported"]].sort_values("churn_rate_pct", ascending=True)
+axes[1].barh(seg_ind_plot["industry"], seg_ind_plot["churn_rate_pct"], color="#1a6b3c")
+axes[1].set_title("Churn Rate by Industry (n >= 20)", fontsize=12)
+axes[1].set_xlabel("Churn Rate (%)")
+for i, (_, row) in enumerate(seg_ind_plot.iterrows()):
+    axes[1].text(row["churn_rate_pct"] + 0.5, i, f"{row['churn_rate_pct']:.1f}%  n={row['total']}", va="center", fontsize=9)
+axes[1].set_xlim(0, seg_ind_plot["churn_rate_pct"].max() * 1.25 if len(seg_ind_plot) > 0 else 100)
+
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "sq3_churn_segments.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("\n  Chart saved: sq3_churn_segments.png")
+
+# -----------------------------------------------------------------------------
+# SQ4: What behavioral signals precede churn (60-day observation window)?
+# -----------------------------------------------------------------------------
+print("\n--- SQ4: Pre-churn behavioral signals (60-day window) ---")
+
+# For churned accounts: 60-day window ending at churn_date
+# For active accounts: 60-day window ending at dataset end (2024-12-31)
+OBS_END_ACTIVE = pd.Timestamp("2024-12-31")
+OBS_WINDOW_DAYS = 60
+
+# Deduplicated feature_usage (already cleaned in Phase 1 via dedup; reload with same logic)
+fu = pd.read_csv(DATA_DIR / "ravenstack_feature_usage.csv", parse_dates=["usage_date"])
+fu = fu.drop_duplicates(subset="usage_id", keep="first")
+# Join subscription → account
+fu = fu.merge(subs_paid[["subscription_id", "account_id"]], on="subscription_id", how="inner")
+
+# Churned accounts: window = [churn_date - 60d, churn_date)
+churned_windows = churn_first[["account_id", "churn_date"]].copy()
+churned_windows["window_start"] = churned_windows["churn_date"] - pd.Timedelta(days=OBS_WINDOW_DAYS)
+churned_windows["group"] = "churned"
+
+# Active accounts: window = [OBS_END_ACTIVE - 60d, OBS_END_ACTIVE]
+active_ids = acct[acct["is_churned"] == False]["account_id"]
+active_windows = pd.DataFrame({
+    "account_id": active_ids,
+    "churn_date": OBS_END_ACTIVE,
+    "window_start": OBS_END_ACTIVE - pd.Timedelta(days=OBS_WINDOW_DAYS),
+    "group": "active"
+})
+
+windows = pd.concat([churned_windows, active_windows], ignore_index=True)
+
+# Tag each feature_usage row with group membership
+fu_tagged = fu.merge(windows[["account_id", "window_start", "churn_date", "group"]], on="account_id", how="inner")
+fu_in_window = fu_tagged[
+    (fu_tagged["usage_date"] >= fu_tagged["window_start"]) &
+    (fu_tagged["usage_date"] < fu_tagged["churn_date"])
+]
+
+# Aggregate per account: usage days, total events, distinct features, errors
+fu_agg = (
+    fu_in_window
+    .groupby(["account_id", "group"])
+    .agg(
+        usage_days=("usage_date", "nunique"),
+        total_events=("usage_count", "sum"),
+        distinct_features=("feature_name", "nunique"),
+        total_errors=("error_count", "sum")
+    )
+    .reset_index()
+)
+
+# Accounts with zero activity in window also matter — fill with 0
+all_acct_groups = windows[["account_id", "group"]].drop_duplicates()
+fu_agg_full = all_acct_groups.merge(fu_agg.drop(columns="group"), on="account_id", how="left").fillna(0)
+fu_agg_full["group"] = all_acct_groups["group"].values
+
+# Summary by group
+prechurn_summary = fu_agg_full.groupby("group")[["usage_days", "total_events", "distinct_features", "total_errors"]].median().round(2)
+print(f"\n  Median feature usage in 60-day window:")
+print(f"  {'Metric':<25} {'Churned':>10} {'Active':>10}")
+print(f"  {'-' * 45}")
+for metric in ["usage_days", "total_events", "distinct_features", "total_errors"]:
+    c_val = prechurn_summary.loc["churned", metric] if "churned" in prechurn_summary.index else float("nan")
+    a_val = prechurn_summary.loc["active", metric] if "active" in prechurn_summary.index else float("nan")
+    print(f"  {metric:<25} {c_val:>10.1f} {a_val:>10.1f}")
+
+# Support metrics in 60-day window
+st = pd.read_csv(DATA_DIR / "ravenstack_support_tickets.csv", parse_dates=["submitted_at", "closed_at"])
+st_tagged = st.merge(windows[["account_id", "window_start", "churn_date", "group"]], on="account_id", how="inner")
+st_in_window = st_tagged[
+    (st_tagged["submitted_at"] >= st_tagged["window_start"]) &
+    (st_tagged["submitted_at"] < st_tagged["churn_date"])
+]
+st_agg = (
+    st_in_window
+    .groupby(["account_id", "group"])
+    .agg(
+        ticket_count=("ticket_id", "count"),
+        escalations=("escalation_flag", "sum"),
+        avg_resolution_hrs=("resolution_time_hours", "mean"),
+        avg_satisfaction=("satisfaction_score", "mean")  # nulls excluded by mean()
+    )
+    .reset_index()
+)
+st_agg_full = all_acct_groups.merge(st_agg.drop(columns="group"), on="account_id", how="left").fillna({"ticket_count": 0, "escalations": 0})
+st_agg_full["group"] = all_acct_groups["group"].values
+
+support_summary = st_agg_full.groupby("group")[["ticket_count", "escalations", "avg_resolution_hrs", "avg_satisfaction"]].median().round(2)
+print(f"\n  Median support metrics in 60-day window:")
+print(f"  {'Metric':<30} {'Churned':>10} {'Active':>10}")
+print(f"  {'-' * 50}")
+for metric in ["ticket_count", "escalations", "avg_resolution_hrs", "avg_satisfaction"]:
+    c_val = support_summary.loc["churned", metric] if "churned" in support_summary.index else float("nan")
+    a_val = support_summary.loc["active", metric] if "active" in support_summary.index else float("nan")
+    c_str = f"{c_val:.1f}" if pd.notna(c_val) else "N/A"
+    a_str = f"{a_val:.1f}" if pd.notna(a_val) else "N/A"
+    print(f"  {metric:<30} {c_str:>10} {a_str:>10}")
+
+# Chart: boxplots of key pre-churn signals
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+metrics_to_plot = [
+    (fu_agg_full, "distinct_features", "Distinct Features Used (60d)", axes[0, 0]),
+    (fu_agg_full, "usage_days",        "Active Usage Days (60d)",      axes[0, 1]),
+    (st_agg_full, "ticket_count",      "Support Tickets Filed (60d)",  axes[1, 0]),
+    (fu_agg_full, "total_errors",      "Total Errors (60d)",           axes[1, 1]),
+]
+pal = {"churned": "#c0392b", "active": "#27ae60"}
+for df, col, title, ax in metrics_to_plot:
+    for grp, color in pal.items():
+        vals = df[df["group"] == grp][col].dropna()
+        ax.boxplot(vals, positions=[list(pal.keys()).index(grp)], patch_artist=True,
+                   boxprops=dict(facecolor=color, alpha=0.7),
+                   medianprops=dict(color="black", linewidth=2),
+                   whiskerprops=dict(color=color), capprops=dict(color=color),
+                   flierprops=dict(marker=".", markersize=3, alpha=0.4, color=color))
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["Churned", "Active"])
+    ax.set_title(title, fontsize=11)
+    ax.set_ylabel("Count")
+
+plt.suptitle("Pre-Churn Behavioral Signals: Churned vs Active Accounts (60-Day Window)", fontsize=12, y=1.01)
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "sq4_prechurn_signals.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("\n  Chart saved: sq4_prechurn_signals.png")
+
+# Sensitivity check: repeat for 30d and 90d windows (median distinct_features only)
+for window_d in [30, 90]:
+    fu_sens = fu_tagged.copy()
+    fu_sens["window_start_sens"] = fu_sens["churn_date"] - pd.Timedelta(days=window_d)
+    fu_in_sens = fu_sens[
+        (fu_sens["usage_date"] >= fu_sens["window_start_sens"]) &
+        (fu_sens["usage_date"] < fu_sens["churn_date"])
+    ]
+    sens_agg = fu_in_sens.groupby(["account_id", "group"])["feature_name"].nunique().reset_index(name="distinct_features")
+    sens_full = all_acct_groups.merge(sens_agg.drop(columns="group"), on="account_id", how="left").fillna(0)
+    sens_full["group"] = all_acct_groups["group"].values
+    sens_med = sens_full.groupby("group")["distinct_features"].median()
+    c = sens_med.get("churned", float("nan"))
+    a = sens_med.get("active", float("nan"))
+    print(f"  Sensitivity {window_d}d window — median distinct features: churned={c:.1f}  active={a:.1f}")
+
+# -----------------------------------------------------------------------------
+# SQ5: Which features are associated with better retention?
+# -----------------------------------------------------------------------------
+print("\n--- SQ5: Feature adoption vs churn ---")
+
+# Lifetime feature breadth per account (all time, not windowed)
+fu_lifetime = (
+    fu.groupby("account_id")
+    .agg(
+        lifetime_features=("feature_name", "nunique"),
+        lifetime_events=("usage_count", "sum"),
+        lifetime_errors=("error_count", "sum")
+    )
+    .reset_index()
+)
+acct_feat = acct.merge(fu_lifetime, on="account_id", how="left").fillna(0)
+
+feat_by_churn = acct_feat.groupby("is_churned")[["lifetime_features", "lifetime_events", "lifetime_errors"]].median().round(2)
+print(f"\n  Median lifetime feature metrics:")
+print(f"  {'Metric':<25} {'Churned (True)':>14} {'Active (False)':>14}")
+print(f"  {'-' * 53}")
+for metric in ["lifetime_features", "lifetime_events", "lifetime_errors"]:
+    c_val = feat_by_churn.loc[True, metric] if True in feat_by_churn.index else float("nan")
+    a_val = feat_by_churn.loc[False, metric] if False in feat_by_churn.index else float("nan")
+    print(f"  {metric:<25} {c_val:>14.1f} {a_val:>14.1f}")
+
+# Per-feature retention index: P(not churned | used feature) vs baseline
+# baseline = overall non-churn rate among non-trial accounts
+baseline_retention = 1 - acct["is_churned"].mean()
+
+all_features = fu["feature_name"].unique()
+feat_retention = []
+for feat in all_features:
+    users = fu[fu["feature_name"] == feat]["account_id"].unique()
+    users_acct = acct[acct["account_id"].isin(users)]
+    n = len(users_acct)
+    if n < MIN_SEG:
+        continue
+    ret_rate = 1 - users_acct["is_churned"].mean()
+    feat_retention.append({
+        "feature": feat,
+        "n_accounts": n,
+        "retention_rate_pct": ret_rate * 100,
+        "retention_index": ret_rate / baseline_retention  # >1 = above average retention
+    })
+
+feat_ret_df = pd.DataFrame(feat_retention).sort_values("retention_index", ascending=False)
+print(f"\n  Baseline retention rate: {baseline_retention * 100:.1f}%")
+print(f"\n  Top 10 features by retention index (n >= {MIN_SEG}):")
+print(f"  {'Feature':<35} {'n':>5} {'Ret %':>7} {'Index':>7}")
+print(f"  {'-' * 56}")
+for _, row in feat_ret_df.head(10).iterrows():
+    print(f"  {row['feature']:<35} {int(row['n_accounts']):>5} {row['retention_rate_pct']:>7.1f}% {row['retention_index']:>7.2f}x")
+
+print(f"\n  Bottom 5 features by retention index:")
+for _, row in feat_ret_df.tail(5).iterrows():
+    print(f"  {row['feature']:<35} {int(row['n_accounts']):>5} {row['retention_rate_pct']:>7.1f}% {row['retention_index']:>7.2f}x")
+
+# Chart: feature retention index (top 15, sorted)
+top_feat = feat_ret_df.head(15).sort_values("retention_index", ascending=True)
+fig, ax = plt.subplots(figsize=(10, 7))
+colors = ["#27ae60" if v >= 1 else "#c0392b" for v in top_feat["retention_index"]]
+ax.barh(top_feat["feature"], top_feat["retention_index"], color=colors)
+ax.axvline(1.0, color="black", linestyle="--", linewidth=1, label="Baseline (1.0x)")
+ax.set_title("Feature Retention Index — Top 15 Features\n(>1.0x = above-average retention among users)", fontsize=12)
+ax.set_xlabel("Retention Index (feature users vs baseline)")
+ax.legend()
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "sq5_feature_adoption.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("\n  Chart saved: sq5_feature_adoption.png")
+
+# -----------------------------------------------------------------------------
+# SQ6: How does support volume and quality relate to churn?
+# -----------------------------------------------------------------------------
+print("\n--- SQ6: Support → churn relationship ---")
+
+# Lifetime support metrics per account
+st_lifetime = (
+    st.groupby("account_id")
+    .agg(
+        total_tickets=("ticket_id", "count"),
+        total_escalations=("escalation_flag", "sum"),
+        avg_resolution_hrs=("resolution_time_hours", "mean"),
+        avg_satisfaction=("satisfaction_score", "mean"),  # nulls excluded
+        pct_high_priority=("priority", lambda x: (x == "High").mean() * 100)
+    )
+    .reset_index()
+)
+acct_support = acct.merge(st_lifetime, on="account_id", how="left").fillna({"total_tickets": 0, "total_escalations": 0})
+
+supp_by_churn = acct_support.groupby("is_churned")[
+    ["total_tickets", "total_escalations", "avg_resolution_hrs", "avg_satisfaction", "pct_high_priority"]
+].median().round(2)
+
+print(f"\n  Median lifetime support metrics by churn status:")
+print(f"  {'Metric':<30} {'Churned (True)':>14} {'Active (False)':>14}")
+print(f"  {'-' * 58}")
+for metric in ["total_tickets", "total_escalations", "avg_resolution_hrs", "avg_satisfaction", "pct_high_priority"]:
+    c_val = supp_by_churn.loc[True, metric] if True in supp_by_churn.index else float("nan")
+    a_val = supp_by_churn.loc[False, metric] if False in supp_by_churn.index else float("nan")
+    c_str = f"{c_val:.1f}" if pd.notna(c_val) else "N/A"
+    a_str = f"{a_val:.1f}" if pd.notna(a_val) else "N/A"
+    print(f"  {metric:<30} {c_str:>14} {a_str:>14}")
+
+# Escalation flag: churn rate among escalated vs non-escalated accounts
+escalated = acct_support[acct_support["total_escalations"] > 0]
+non_escalated = acct_support[acct_support["total_escalations"] == 0]
+esc_churn = escalated["is_churned"].mean() * 100
+non_esc_churn = non_escalated["is_churned"].mean() * 100
+print(f"\n  Churn rate — accounts with escalation:     {esc_churn:.1f}%  (n={len(escalated)})")
+print(f"  Churn rate — accounts without escalation:  {non_esc_churn:.1f}%  (n={len(non_escalated)})")
+
+# Chart: support metrics by churn status
+fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+supp_metrics = [
+    ("total_tickets",      "Total Lifetime Tickets",      axes[0]),
+    ("total_escalations",  "Total Escalations",           axes[1]),
+    ("avg_satisfaction",   "Avg Satisfaction Score",      axes[2]),
+]
+for col, title, ax in supp_metrics:
+    data_c = acct_support[acct_support["is_churned"] == True][col].dropna()
+    data_a = acct_support[acct_support["is_churned"] == False][col].dropna()
+    ax.boxplot([data_c, data_a], patch_artist=True,
+               boxprops=dict(facecolor="#c0392b", alpha=0.7),
+               medianprops=dict(color="black", linewidth=2))
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels(["Churned", "Active"])
+    ax.set_title(title, fontsize=11)
+    ax.set_ylabel(col.replace("_", " ").title())
+
+# Fix: boxplot for active gets blue color override
+for col, title, ax in supp_metrics:
+    patches = ax.patches
+    if len(patches) >= 2:
+        patches[1].set_facecolor("#27ae60")
+
+plt.suptitle("Support Metrics by Churn Status (Lifetime)", fontsize=12)
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "sq6_support_churn.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("\n  Chart saved: sq6_support_churn.png")
+
+# -----------------------------------------------------------------------------
+# SQ7: What is GRR by segment, and where does expansion MRR come from?
+# NRR deprecated (concurrent subscription accumulation inflates to ~335%).
+# GRR is the reliable revenue retention metric.
+# -----------------------------------------------------------------------------
+print("\n--- SQ7: GRR + expansion analysis ---")
+
+# GRR from nrr_df (rolling 12-month, computed in Phase 3)
+# nrr_df columns: cohort_month (Period[M]), n_accounts, starting_mrr, ending_mrr, nrr_pct, grr_pct
+print(f"\n  12-month rolling GRR (overall):")
+print(f"    Median: {nrr_df['grr_pct'].median():.1f}%")
+print(f"    Min:    {nrr_df['grr_pct'].min():.1f}%  ({nrr_df.loc[nrr_df['grr_pct'].idxmin(), 'cohort_month']})")
+print(f"    Max:    {nrr_df['grr_pct'].max():.1f}%  ({nrr_df.loc[nrr_df['grr_pct'].idxmax(), 'cohort_month']})")
+print(f"    Benchmark: 80–90% (SaaS standard)")
+
+# Expansion: subscriptions with upgrade_flag = True
+# subs_paid already carries plan_tier — no merge needed
+upgrades = subs_paid[subs_paid["upgrade_flag"] == True]
+upgrade_counts = upgrades.groupby("plan_tier").agg(
+    upgrade_events=("subscription_id", "count"),
+    upgrade_mrr=("mrr_amount", "sum")
+).reset_index()
+
+acct_counts = seg_base.groupby("plan_tier").agg(total_accounts=("account_id", "count")).reset_index()
+upgrade_summary = upgrade_counts.merge(acct_counts, on="plan_tier", how="left")
+upgrade_summary["upgrades_per_account"] = (upgrade_summary["upgrade_events"] / upgrade_summary["total_accounts"]).round(2)
+upgrade_summary["avg_upgrade_mrr"] = (upgrade_summary["upgrade_mrr"] / upgrade_summary["upgrade_events"]).round(0)
+
+print(f"\n  Upgrade events by plan tier:")
+print(f"  {'Tier':<14} {'Upgrades':>9} {'Upgrades/Acct':>14} {'Avg Upgrade MRR':>16} {'Total Upgrade MRR':>18}")
+print(f"  {'-' * 73}")
+for _, row in upgrade_summary.sort_values("upgrade_events", ascending=False).iterrows():
+    print(f"  {row['plan_tier']:<14} {int(row['upgrade_events']):>9} {row['upgrades_per_account']:>14.2f} ${row['avg_upgrade_mrr']:>15,.0f} ${row['upgrade_mrr']:>17,.0f}")
+
+# Downgrade events for contrast — subs_paid already has plan_tier
+downgrades = subs_paid[subs_paid["downgrade_flag"] == True]
+downgrade_counts = downgrades.groupby("plan_tier").agg(
+    downgrade_events=("subscription_id", "count"),
+    downgrade_mrr=("mrr_amount", "sum")
+).reset_index()
+
+print(f"\n  Downgrade events by plan tier:")
+for _, row in downgrade_counts.sort_values("downgrade_events", ascending=False).iterrows():
+    print(f"    {row['plan_tier']:<14}: {int(row['downgrade_events'])} events  (${row['downgrade_mrr']:,.0f} MRR)")
+
+# Chart: GRR trend over time + upgrade MRR by tier
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# cohort_month is Period[M] — filter and convert to Timestamp for matplotlib
+grr_excl = nrr_df[nrr_df["cohort_month"] < pd.Period("2024-12", "M")]
+axes[0].plot(grr_excl["cohort_month"].dt.to_timestamp(), grr_excl["grr_pct"], color="#1a3a5c", linewidth=2, marker="o", markersize=4)
+axes[0].axhline(80, color="#c0392b", linestyle="--", linewidth=1, label="80% benchmark (floor)")
+axes[0].axhline(90, color="#27ae60", linestyle="--", linewidth=1, label="90% benchmark (target)")
+axes[0].set_title("12-Month Rolling GRR (ex-Dec 2024)", fontsize=12)
+axes[0].set_xlabel("Month")
+axes[0].set_ylabel("GRR (%)")
+axes[0].legend(fontsize=9)
+axes[0].set_ylim(0, 120)
+
+tier_upg = upgrade_summary.sort_values("upgrade_mrr", ascending=True)
+axes[1].barh(tier_upg["plan_tier"], tier_upg["upgrade_mrr"] / 1000, color="#2878b5")
+axes[1].set_title("Total Upgrade MRR by Plan Tier", fontsize=12)
+axes[1].set_xlabel("Upgrade MRR ($K)")
+axes[1].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:.0f}K"))
+
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "sq7_grr_expansion.png", dpi=150, bbox_inches="tight")
+plt.close()
+print("\n  Chart saved: sq7_grr_expansion.png")
+
+# =============================================================================
+# --- Phase 4 summary ---
+# =============================================================================
+
+print(f"\n{'=' * 70}")
+print("PHASE 4 SUMMARY — SUB-QUESTION ANALYSIS (SQ1–SQ7)")
+print(f"{'=' * 70}")
+print()
+print("  SQ1 — MRR Trend:")
+print(f"    MRR grew from ${mrr_jan23:,.0f} to ${mrr_nov24:,.0f} (ex-Dec 2024)")
+print(f"    Peak MRR: ${mrr_peak:,.0f} ({mrr_peak_month})")
+print(f"    Tier mix at end of period:")
+for tier in tier_order:
+    if tier in tier_share_end.index:
+        print(f"      {tier:<14}: {tier_share_end[tier]:.1f}%")
+print()
+print("  SQ2 — Cohort Retention:")
+m1 = agg_retention.get("M1", None)
+if m1 is not None and pd.notna(m1):
+    print(f"    M0→M1 drop: {m0 - m1:.1f} pp (dominant early-churn signal)")
+if "M6" in cohort_ret.columns and len(m6_ret) >= 2:
+    print(f"    Best M6 cohort:  {best_cohort_m6.strftime('%b %Y')}  ({m6_ret[best_cohort_m6]:.1f}%)")
+    print(f"    Worst M6 cohort: {worst_cohort_m6.strftime('%b %Y')}  ({m6_ret[worst_cohort_m6]:.1f}%)")
+print()
+print("  SQ3 — Churn Segmentation:")
+print("    (see printed tables above for full segment breakdown)")
+print()
+print("  SQ4 — Pre-Churn Signals (60d window):")
+print("    (see printed tables above; sensitivity check at 30d and 90d)")
+print()
+print("  SQ5 — Feature Adoption:")
+print(f"    Baseline retention rate: {baseline_retention * 100:.1f}%")
+if len(feat_ret_df) > 0:
+    top_f = feat_ret_df.iloc[0]
+    print(f"    Highest retention-index feature: {top_f['feature']} ({top_f['retention_index']:.2f}x)")
+print()
+print("  SQ6 — Support → Churn:")
+print(f"    Churn rate with escalation:    {esc_churn:.1f}%")
+print(f"    Churn rate without escalation: {non_esc_churn:.1f}%")
+print()
+print("  SQ7 — GRR + Expansion:")
+print(f"    Median GRR: {nrr_df['grr_pct'].median():.1f}%  (benchmark: 80–90%)")
+print(f"    NRR deprecated (concurrent subscription model)")
+print()
+print("  Charts saved: sq1_mrr_by_tier, sq3_churn_segments, sq4_prechurn_signals,")
+print("                sq5_feature_adoption, sq6_support_churn, sq7_grr_expansion")
+print()
+print(f"\n  Ready to proceed to Phase 5 (model / SQ8): PENDING REVIEW")
+print(f"{'=' * 70}\n")
 
 # === Phase 5 / Model: SQ8 — feature engineering + logistic regression + XGBoost ===
 
