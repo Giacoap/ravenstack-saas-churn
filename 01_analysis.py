@@ -640,6 +640,444 @@ print(f"{'=' * 70}\n")
 # MRR decomposition, NRR, GRR, logo churn rate, revenue churn rate, cohort retention
 # =============================================================================
 
+print("=" * 70)
+print("PHASE 3: METRIC CALCULATION")
+print("=" * 70)
+
+MONTHS = pd.period_range(start="2023-01", end="2024-12", freq="M")
+
+# Non-trial subscriptions only (trials excluded from all revenue metrics per scoping doc)
+subs_paid = subscriptions[subscriptions["is_trial"] == False].copy()
+subs_paid["start_month"] = subs_paid["start_date"].dt.to_period("M")
+subs_paid["end_month"]   = subs_paid["end_date"].dt.to_period("M")
+
+# =============================================================================
+# --- 3.0 Monthly MRR panel ---
+# One row per (subscription, month) for every month the subscription was active.
+# "Active" = start_date <= month_end AND (end_date is null OR end_date >= month_start).
+# This panel is the single source of truth for all revenue metrics below.
+# =============================================================================
+
+panels = []
+for m in MONTHS:
+    m_ts  = m.to_timestamp()
+    m_end = (m + 1).to_timestamp() - pd.Timedelta(seconds=1)
+    mask  = (subs_paid["start_date"] <= m_end) & (
+        subs_paid["end_date"].isna() | (subs_paid["end_date"] >= m_ts)
+    )
+    chunk = subs_paid.loc[mask, [
+        "subscription_id", "account_id", "mrr_amount", "plan_tier",
+        "churn_flag", "upgrade_flag", "downgrade_flag",
+    ]].copy()
+    chunk["month"] = m
+    panels.append(chunk)
+
+mrr_panel = pd.concat(panels, ignore_index=True)
+
+# Account-level MRR by month (sums concurrent subscriptions per account)
+acct_monthly_mrr = (
+    mrr_panel
+    .groupby(["account_id", "month"])["mrr_amount"]
+    .sum()
+    .reset_index()
+    .rename(columns={"mrr_amount": "mrr"})
+)
+
+# =============================================================================
+# --- 3.1 Total MRR trend ---
+# =============================================================================
+
+monthly_totals = (
+    mrr_panel.groupby("month")["mrr_amount"]
+    .sum()
+    .reset_index()
+    .rename(columns={"mrr_amount": "total_mrr"})
+)
+
+mrr_start = monthly_totals.iloc[0]["total_mrr"]
+mrr_end   = monthly_totals.iloc[-1]["total_mrr"]
+mrr_growth_pct = (mrr_end / mrr_start - 1) * 100
+
+print(f"\n{'-' * 60}")
+print("3.1 TOTAL MRR TREND")
+print(f"{'-' * 60}")
+print(monthly_totals.to_string(index=False))
+print(f"\n  Start (Jan 2023): ${mrr_start:>12,.0f}")
+print(f"  End   (Dec 2024): ${mrr_end:>12,.0f}")
+print(f"  Change over period: {mrr_growth_pct:+.1f}%")
+
+# =============================================================================
+# --- 3.2 MRR decomposition ---
+# Movement categories per subscription when it starts:
+#   new        — first paid sub for this account (no prior paid sub)
+#   expansion  — subsequent sub, upgrade_flag=True, positive MRR delta
+#   contraction— subsequent sub, downgrade_flag=True, negative MRR delta
+#   churned    — subs ending this month with churn_flag=True (tracked separately)
+# Limitation: delta is vs the immediately preceding subscription for the account,
+# which may miss same-month transitions. Documented as approximation.
+# =============================================================================
+
+subs_sorted = subs_paid.sort_values(["account_id", "start_date"]).copy()
+subs_sorted["prev_mrr"]    = subs_sorted.groupby("account_id")["mrr_amount"].shift(1)
+subs_sorted["is_first_sub"] = subs_sorted["prev_mrr"].isna()
+subs_sorted["mrr_delta"]   = subs_sorted["mrr_amount"] - subs_sorted["prev_mrr"].fillna(0)
+
+new_mrr_m = (
+    subs_sorted[subs_sorted["is_first_sub"]]
+    .groupby("start_month")["mrr_amount"].sum()
+    .rename("new_mrr")
+)
+expansion_m = (
+    subs_sorted[
+        ~subs_sorted["is_first_sub"]
+        & subs_sorted["upgrade_flag"]
+        & (subs_sorted["mrr_delta"] > 0)
+    ]
+    .groupby("start_month")["mrr_delta"].sum()
+    .rename("expansion_mrr")
+)
+contraction_m = (
+    subs_sorted[
+        ~subs_sorted["is_first_sub"]
+        & subs_sorted["downgrade_flag"]
+        & (subs_sorted["mrr_delta"] < 0)
+    ]
+    .groupby("start_month")["mrr_delta"].sum()
+    .abs()
+    .rename("contraction_mrr")
+)
+churned_mrr_m = (
+    subs_paid[subs_paid["churn_flag"] == True]
+    .groupby("end_month")["mrr_amount"].sum()
+    .rename("churned_mrr")
+)
+
+decomp = (
+    monthly_totals.set_index("month")
+    .join(new_mrr_m, how="left")
+    .join(expansion_m, how="left")
+    .join(contraction_m, how="left")
+    .join(churned_mrr_m, how="left")
+    .fillna(0)
+    .reset_index()
+)
+decomp["net_new_mrr"] = (
+    decomp["new_mrr"] + decomp["expansion_mrr"]
+    - decomp["contraction_mrr"] - decomp["churned_mrr"]
+)
+
+print(f"\n{'-' * 60}")
+print("3.2 MRR DECOMPOSITION")
+print(f"{'-' * 60}")
+decomp_display = decomp.copy()
+for col in ["total_mrr", "new_mrr", "expansion_mrr", "contraction_mrr", "churned_mrr", "net_new_mrr"]:
+    decomp_display[col] = decomp_display[col].map(lambda x: f"${x:,.0f}")
+print(decomp_display.to_string(index=False))
+
+print(f"\n  24-month totals:")
+print(f"    New MRR:         ${decomp['new_mrr'].sum():>12,.0f}")
+print(f"    Expansion MRR:   ${decomp['expansion_mrr'].sum():>12,.0f}")
+print(f"    Contraction MRR: ${decomp['contraction_mrr'].sum():>12,.0f}")
+print(f"    Churned MRR:     ${decomp['churned_mrr'].sum():>12,.0f}")
+print(f"    Net MRR change:  ${decomp['net_new_mrr'].sum():>12,.0f}")
+
+# Chart: MRR trend + waterfall components
+fig, axes = plt.subplots(2, 1, figsize=(13, 9))
+x            = range(len(MONTHS))
+month_labels = [str(m) for m in decomp["month"]]
+
+axes[0].plot(x, decomp["total_mrr"] / 1_000, color=C_BLUE, linewidth=2, marker="o", markersize=3)
+axes[0].fill_between(x, decomp["total_mrr"] / 1_000, alpha=0.12, color=C_BLUE)
+axes[0].set_title("Total Monthly MRR — Non-Trial Subscriptions", fontsize=12)
+axes[0].set_ylabel("MRR ($K)")
+axes[0].set_xticks(x)
+axes[0].set_xticklabels(month_labels, rotation=45, ha="right", fontsize=8)
+
+axes[1].bar(x, decomp["new_mrr"] / 1_000, label="New MRR", color=C_GREEN)
+axes[1].bar(x, decomp["expansion_mrr"] / 1_000,
+            bottom=decomp["new_mrr"] / 1_000, label="Expansion MRR", color=C_BLUE)
+axes[1].bar(x, -decomp["contraction_mrr"] / 1_000, label="Contraction MRR", color=C_GREY)
+axes[1].bar(x, -decomp["churned_mrr"] / 1_000,
+            bottom=-decomp["contraction_mrr"] / 1_000, label="Churned MRR", color=C_RED)
+axes[1].axhline(0, color="black", linewidth=0.8)
+axes[1].set_title("Monthly MRR Movements", fontsize=12)
+axes[1].set_ylabel("MRR ($K)")
+axes[1].set_xticks(x)
+axes[1].set_xticklabels(month_labels, rotation=45, ha="right", fontsize=8)
+axes[1].legend(loc="upper right", fontsize=9)
+
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "metrics_01_mrr_trend.png", dpi=150)
+plt.close()
+print(f"\n  Chart saved: viz/metrics_01_mrr_trend.png")
+
+# =============================================================================
+# --- 3.3 Monthly logo churn rate ---
+# Denominator: non-trial accounts active at START of month M
+#   (signed up before M AND not yet churned as of M start)
+# Numerator: non-reactivation churn events with churn_date in M
+# =============================================================================
+
+print(f"\n{'-' * 60}")
+print("3.3 MONTHLY LOGO CHURN RATE")
+print(f"{'-' * 60}")
+
+churn_by_month = (
+    churn_events[churn_events["is_reactivation"] == False]
+    .assign(churn_month=lambda df: df["churn_date"].dt.to_period("M"))
+    .groupby("churn_month")
+    .size()
+    .rename("churned_accounts")
+)
+
+logo_churn_records = []
+for m in MONTHS:
+    m_ts = m.to_timestamp()
+    active_at_start = acct[
+        (acct["signup_date"] < m_ts)
+        & (acct["first_churn_date"].isna() | (acct["first_churn_date"] >= m_ts))
+    ]
+    n_active  = len(active_at_start)
+    n_churned = int(churn_by_month.get(m, 0))
+    logo_churn_records.append({
+        "month":              m,
+        "active_at_start":    n_active,
+        "churned":            n_churned,
+        "logo_churn_rate_pct": round(n_churned / n_active * 100, 2) if n_active > 0 else np.nan,
+    })
+
+logo_churn_df = pd.DataFrame(logo_churn_records)
+print(logo_churn_df.to_string(index=False))
+
+avg_logo_churn = logo_churn_df["logo_churn_rate_pct"].mean()
+ann_logo_churn = (1 - (1 - avg_logo_churn / 100) ** 12) * 100
+print(f"\n  Average monthly logo churn rate: {avg_logo_churn:.2f}%")
+print(f"  Implied annualized rate:         {ann_logo_churn:.1f}%")
+print(f"  Min: {logo_churn_df['logo_churn_rate_pct'].min():.2f}%  "
+      f"Max: {logo_churn_df['logo_churn_rate_pct'].max():.2f}%")
+
+# =============================================================================
+# --- 3.4 Revenue churn rate ---
+# Denominator: total active MRR at start of month M (= total_mrr in panel,
+#   which includes subscriptions active at any point during M, capturing
+#   subscriptions that churn during M in the denominator)
+# Numerator: MRR of subscriptions that ended with churn_flag=True in M
+# =============================================================================
+
+print(f"\n{'-' * 60}")
+print("3.4 REVENUE CHURN RATE")
+print(f"{'-' * 60}")
+
+churned_mrr_lookup = (
+    subs_paid[subs_paid["churn_flag"] == True]
+    .groupby("end_month")["mrr_amount"]
+    .sum()
+    .rename("churned_mrr_usd")
+)
+
+rev_churn_records = []
+for _, row in decomp.iterrows():
+    m              = row["month"]
+    starting_mrr   = row["total_mrr"]
+    churned_mrr_v  = float(churned_mrr_lookup.get(m, 0))
+    rev_churn_records.append({
+        "month":             m,
+        "starting_mrr":      starting_mrr,
+        "churned_mrr_usd":   churned_mrr_v,
+        "rev_churn_rate_pct": round(churned_mrr_v / starting_mrr * 100, 2)
+        if starting_mrr > 0 else np.nan,
+    })
+
+rev_churn_df = pd.DataFrame(rev_churn_records)
+print(rev_churn_df.to_string(index=False))
+
+avg_rev_churn = rev_churn_df["rev_churn_rate_pct"].mean()
+print(f"\n  Average monthly revenue churn rate: {avg_rev_churn:.2f}%")
+
+# Chart: logo + revenue churn rates
+fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+
+axes[0].bar(x, logo_churn_df["logo_churn_rate_pct"], color=C_RED, alpha=0.8)
+axes[0].axhline(avg_logo_churn, color="black", linewidth=1.2, linestyle="--",
+                label=f"Avg {avg_logo_churn:.1f}%")
+axes[0].set_title("Monthly Logo Churn Rate (non-trial accounts)", fontsize=11)
+axes[0].set_ylabel("Logo Churn Rate (%)")
+axes[0].legend()
+
+axes[1].bar(x, rev_churn_df["rev_churn_rate_pct"], color=C_RED, alpha=0.6)
+axes[1].axhline(avg_rev_churn, color="black", linewidth=1.2, linestyle="--",
+                label=f"Avg {avg_rev_churn:.1f}%")
+axes[1].set_title("Monthly Revenue Churn Rate", fontsize=11)
+axes[1].set_ylabel("Revenue Churn Rate (%)")
+axes[1].set_xticks(x)
+axes[1].set_xticklabels(month_labels, rotation=45, ha="right", fontsize=8)
+axes[1].legend()
+
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "metrics_02_churn_rates.png", dpi=150)
+plt.close()
+print(f"\n  Chart saved: viz/metrics_02_churn_rates.png")
+
+# =============================================================================
+# --- 3.5 NRR and GRR (12-month rolling) ---
+# For each starting month M in 2023 (so that M+12 falls within the dataset):
+#   NRR(M) = sum(account MRR at M+12) / sum(account MRR at M) × 100
+#   GRR(M) = NRR excluding expansion — each account's M+12 MRR capped at M MRR
+# Accounts that churned by M+12 contribute 0 to the numerator.
+# =============================================================================
+
+print(f"\n{'-' * 60}")
+print("3.5 NRR AND GRR (12-month rolling)")
+print(f"{'-' * 60}")
+
+nrr_records = []
+for m in pd.period_range(start="2023-01", end="2023-12", freq="M"):
+    m12 = m + 12
+
+    accts_m0  = (acct_monthly_mrr[acct_monthly_mrr["month"] == m]
+                 [["account_id", "mrr"]].rename(columns={"mrr": "mrr_m0"}))
+    accts_m12 = (acct_monthly_mrr[acct_monthly_mrr["month"] == m12]
+                 [["account_id", "mrr"]].rename(columns={"mrr": "mrr_m12"}))
+
+    merged = accts_m0.merge(accts_m12, on="account_id", how="left")
+    merged["mrr_m12"] = merged["mrr_m12"].fillna(0)
+
+    sum_m0   = merged["mrr_m0"].sum()
+    sum_m12  = merged["mrr_m12"].sum()
+    # GRR: cap each account's M+12 MRR at M0 MRR (no expansion credit)
+    sum_grr  = merged[["mrr_m0", "mrr_m12"]].min(axis=1).sum()
+
+    nrr_records.append({
+        "cohort_month": m,
+        "n_accounts":   len(accts_m0),
+        "starting_mrr": int(sum_m0),
+        "ending_mrr":   int(sum_m12),
+        "nrr_pct":      round(sum_m12 / sum_m0 * 100, 1) if sum_m0 > 0 else np.nan,
+        "grr_pct":      round(sum_grr / sum_m0 * 100, 1) if sum_m0 > 0 else np.nan,
+    })
+
+nrr_df = pd.DataFrame(nrr_records)
+print(nrr_df.to_string(index=False))
+
+print(f"\n  Median 12-month NRR: {nrr_df['nrr_pct'].median():.1f}%")
+print(f"  Median 12-month GRR: {nrr_df['grr_pct'].median():.1f}%")
+print(f"  Average NRR:         {nrr_df['nrr_pct'].mean():.1f}%")
+print(f"  Average GRR:         {nrr_df['grr_pct'].mean():.1f}%")
+print(f"  NOTE: GRR = NRR excluding expansion (each account capped at starting MRR).")
+print(f"  BENCHMARK: healthy SaaS NRR ~100-120%, GRR ~80-90%.")
+
+# =============================================================================
+# --- 3.6 Cohort retention ---
+# Signup cohort = month of accounts.signup_date (non-trial)
+# Retention at offset M_n = % of cohort still active n months after signup
+# "Active" = no first-time churn event recorded yet at check_date
+# Milestones: M0, M1, M3, M6, M12, M18, M24
+#
+# ** EDA finding: churned median tenure = 2.7 months vs active median 10.0 months **
+# ** Early attrition should be clearly visible at M1 and M3                       **
+# =============================================================================
+
+print(f"\n{'-' * 60}")
+print("3.6 COHORT RETENTION")
+print(f"  EDA signal: churned median tenure = 2.7 mo vs active 10.0 mo")
+print(f"  Watch M1 and M3 for early-churn concentration")
+print(f"{'-' * 60}")
+
+MILESTONES = [0, 1, 3, 6, 12, 18, 24]
+
+acct_cohort = acct.copy()
+acct_cohort["cohort"] = acct_cohort["signup_date"].dt.to_period("M")
+
+retention_rows = []
+for cohort_period, group in acct_cohort.groupby("cohort"):
+    row = {"cohort": cohort_period, "n": len(group)}
+    for offset in MILESTONES:
+        check_dates = group["signup_date"] + pd.DateOffset(months=offset)
+        valid    = check_dates <= ANALYSIS_END
+        active   = group["first_churn_date"].isna() | (group["first_churn_date"] > check_dates)
+        n_valid  = valid.sum()
+        n_kept   = (active & valid).sum()
+        row[f"M{offset}_n"]   = int(n_kept)
+        row[f"M{offset}_pct"] = round(n_kept / n_valid * 100, 1) if n_valid > 0 else np.nan
+    retention_rows.append(row)
+
+cohort_ret = pd.DataFrame(retention_rows)
+
+pct_cols = ["cohort", "n"] + [f"M{m}_pct" for m in MILESTONES]
+print("\n  Cohort retention (%)  [blank = insufficient observation window]:")
+print(cohort_ret[pct_cols].to_string(index=False))
+
+# Weighted-average aggregate retention curve
+agg_retention = {}
+for offset in MILESTONES:
+    col  = f"M{offset}_pct"
+    valid_rows = cohort_ret[cohort_ret[col].notna()]
+    if len(valid_rows) > 0:
+        agg_retention[f"M{offset}"] = round(
+            (valid_rows[col] * valid_rows["n"]).sum() / valid_rows["n"].sum(), 1
+        )
+    else:
+        agg_retention[f"M{offset}"] = np.nan
+
+print(f"\n  Aggregate retention curve (weighted avg, all cohorts):")
+for k, v in agg_retention.items():
+    bar_len = int(v / 5) if pd.notna(v) else 0
+    display = f"{v}%  {'|' * bar_len}" if pd.notna(v) else "N/A"
+    print(f"    {k:>4}: {display}")
+
+# Chart: cohort retention heatmap
+pct_matrix = cohort_ret.set_index("cohort")[[f"M{m}_pct" for m in MILESTONES]]
+pct_matrix.columns = [f"M{m}" for m in MILESTONES]
+
+fig, ax = plt.subplots(figsize=(10, 12))
+sns.heatmap(
+    pct_matrix,
+    annot=True, fmt=".0f", cmap="RdYlGn",
+    vmin=0, vmax=100,
+    linewidths=0.5, linecolor="white",
+    ax=ax,
+    cbar_kws={"label": "Retention (%)"},
+)
+ax.set_title(
+    "Cohort Retention (%) by Signup Month\n"
+    "Blank = insufficient observation window  |  Early churn visible at M1 & M3",
+    fontsize=11,
+)
+ax.set_xlabel("Months Since Signup")
+ax.set_ylabel("Signup Cohort")
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "metrics_03_cohort_retention.png", dpi=150)
+plt.close()
+print(f"\n  Chart saved: viz/metrics_03_cohort_retention.png")
+
+# =============================================================================
+# --- Phase 3 summary ---
+# =============================================================================
+
+print(f"\n{'=' * 70}")
+print("PHASE 3 SUMMARY — METRICS")
+print(f"{'=' * 70}")
+print(f"  MRR Jan 2023:                ${mrr_start:>12,.0f}")
+print(f"  MRR Dec 2024:                ${mrr_end:>12,.0f}")
+print(f"  MRR change over period:      {mrr_growth_pct:>+.1f}%")
+print()
+print(f"  Avg monthly logo churn:      {avg_logo_churn:>8.2f}%")
+print(f"  Implied annualized:          {ann_logo_churn:>8.1f}%")
+print(f"  Avg monthly rev churn:       {avg_rev_churn:>8.2f}%")
+print()
+print(f"  12-month NRR (median):       {nrr_df['nrr_pct'].median():>8.1f}%")
+print(f"  12-month GRR (median):       {nrr_df['grr_pct'].median():>8.1f}%")
+print()
+print(f"  Aggregate cohort retention:")
+for k, v in agg_retention.items():
+    display = f"{v}%" if pd.notna(v) else "N/A"
+    print(f"    {k:>4}: {display}")
+print()
+print(f"  Charts saved: metrics_01 through metrics_03 in viz/")
+print(f"\n  Ready to proceed to Phase 4 (sub-question analysis): PENDING REVIEW")
+print(f"{'=' * 70}\n")
+
+# =============================================================================
 # === Phase 4: Analysis (mapped to SQ1–SQ9) ===
 
 # === Phase 5 / Model: SQ8 — feature engineering + logistic regression + XGBoost ===
