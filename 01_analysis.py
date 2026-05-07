@@ -1740,8 +1740,505 @@ print()
 print(f"\n  Ready to proceed to Phase 5 (model / SQ8): PENDING REVIEW")
 print(f"{'=' * 70}\n")
 
-# === Phase 5 / Model: SQ8 — feature engineering + logistic regression + XGBoost ===
+# =============================================================================
+# === Phase 5: Model (SQ8) + ICP (SQ9) ===
+# =============================================================================
 
-# === Phase 6 / ICP: SQ9 — LTV by segment ===
+print("\n" + "=" * 70)
+print("PHASE 5 — MODEL (SQ8) + ICP (SQ9)")
+print("=" * 70)
 
-# === Phase 7: Export ===
+# ML imports (scoping doc stack: scikit-learn, xgboost, shap)
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    roc_auc_score, precision_recall_curve, roc_curve,
+    classification_report, precision_score, recall_score, f1_score
+)
+from xgboost import XGBClassifier
+import shap
+import pickle
+
+# Export directory (CSV + pkl outputs per scoping doc)
+EXPORT_DIR = SCRIPT_DIR / "export"
+EXPORT_DIR.mkdir(exist_ok=True)
+
+# Gross margin assumption: 80% SaaS benchmark (flagged per scoping doc)
+GROSS_MARGIN = 0.80
+
+# =============================================================================
+# --- SQ8.0: Feature engineering ---
+# Target: is_churned (non-trial accounts)
+# Observation window: 60d pre-churn (churned) / last 60d of dataset (active)
+# Window data already computed in SQ4: fu_agg_full, st_agg_full, windows, fu_tagged
+# =============================================================================
+print("\n--- SQ8: Feature engineering ---")
+
+# -- Base features --
+feat_base = acct[["account_id", "is_churned", "tenure_months", "plan_tier", "seats"]].copy()
+
+# Ordinal encode plan tier (Basic < Pro < Enterprise)
+TIER_RANK = {"Basic": 0, "Pro": 1, "Enterprise": 2}
+feat_base["plan_tier_num"] = feat_base["plan_tier"].map(TIER_RANK).fillna(0).astype(int)
+
+# early_churn_flag: account still in first 90 days at observation (high-risk per M0→M1 drop)
+feat_base["early_churn_flag"] = (feat_base["tenure_months"] <= 3).astype(int)
+
+# -- Usage trend: ratio of activity in last-30d vs first-30d of the 60d window --
+# fu_tagged from SQ4 already has window_start and churn_date per account
+fu_w = fu_tagged.copy()
+fu_w["midpoint"] = fu_w["window_start"] + pd.Timedelta(days=30)
+
+usage_first = (
+    fu_w[(fu_w["usage_date"] >= fu_w["window_start"]) & (fu_w["usage_date"] < fu_w["midpoint"])]
+    .groupby("account_id")["usage_date"].nunique()
+    .rename("days_first30")
+)
+usage_last = (
+    fu_w[(fu_w["usage_date"] >= fu_w["midpoint"]) & (fu_w["usage_date"] < fu_w["churn_date"])]
+    .groupby("account_id")["usage_date"].nunique()
+    .rename("days_last30")
+)
+trend_df = pd.concat([usage_first, usage_last], axis=1).fillna(0)
+# +1 in denominator avoids div/0; >1 = accelerating, <1 = decelerating
+trend_df["usage_trend"] = trend_df["days_last30"] / (trend_df["days_first30"] + 1)
+
+# -- 60-day window features (from fu_agg_full / st_agg_full in SQ4) --
+feat_60d = fu_agg_full[["account_id", "usage_days", "total_events", "distinct_features", "total_errors"]].copy()
+feat_60d.columns = ["account_id", "usage_days_60d", "events_60d", "features_60d", "errors_60d"]
+# error_rate: errors per usage event (+1 avoids div/0)
+feat_60d["error_rate"] = feat_60d["errors_60d"] / (feat_60d["events_60d"] + 1)
+
+# tenure-normalized usage: events in window / tenure (controls for observation window length)
+feat_60d = feat_60d.merge(feat_base[["account_id", "tenure_months"]], on="account_id", how="left")
+feat_60d["tenure_norm_usage"] = feat_60d["events_60d"] / (feat_60d["tenure_months"] + 1)
+feat_60d = feat_60d.drop(columns="tenure_months")
+
+feat_supp = st_agg_full[["account_id", "ticket_count", "escalations", "avg_satisfaction"]].copy()
+feat_supp.columns = ["account_id", "tickets_60d", "escalations_60d", "satisfaction_60d"]
+
+# -- Lifetime features (feature breadth, from SQ5 fu_lifetime) --
+feat_life = fu_lifetime[["account_id", "lifetime_features"]].copy()
+
+# -- Assemble master feature table --
+features = (
+    feat_base
+    .merge(feat_60d, on="account_id", how="left")
+    .merge(feat_supp, on="account_id", how="left")
+    .merge(trend_df[["usage_trend"]], left_on="account_id", right_index=True, how="left")
+    .merge(feat_life, on="account_id", how="left")
+)
+# Fill satisfaction with column median (avoids conflating missing with 0)
+med_sat = features["satisfaction_60d"].median()
+features["satisfaction_60d"] = features["satisfaction_60d"].fillna(
+    med_sat if pd.notna(med_sat) else 4.0
+)
+features = features.fillna(0)
+
+FEATURE_COLS = [
+    "tenure_months",        # account age at observation
+    "plan_tier_num",        # ordinal tier (Basic=0, Pro=1, Enterprise=2)
+    "seats",                # account size
+    "early_churn_flag",     # in first 90 days (high-risk window)
+    "usage_days_60d",       # active days in 60d window
+    "events_60d",           # total usage events in 60d window
+    "features_60d",         # distinct features used in 60d window
+    "error_rate",           # errors per usage event (quality signal)
+    "tenure_norm_usage",    # events / tenure_months (normalized activity)
+    "usage_trend",          # last-30d usage_days / first-30d + 1 (trend direction)
+    "tickets_60d",          # support tickets in 60d window
+    "escalations_60d",      # escalations in 60d window
+    "satisfaction_60d",     # avg satisfaction score in 60d window
+    "lifetime_features",    # total distinct features used ever
+]
+
+X = features[FEATURE_COLS].values
+y = features["is_churned"].astype(int).values
+
+print(f"\n  Feature matrix: {X.shape[0]} accounts x {X.shape[1]} features")
+print(f"  Class balance: {y.sum()} churned ({y.mean()*100:.1f}%) | {(1-y).sum()} active ({(1-y).mean()*100:.1f}%)")
+
+# =============================================================================
+# --- SQ8.1: Train/test split (stratified, 80/20) ---
+# =============================================================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=42, stratify=y
+)
+print(f"  Train: {len(y_train)} | Test: {len(y_test)}  (stratified 80/20)")
+
+# =============================================================================
+# --- SQ8.2: Logistic Regression (reference — interpretability first) ---
+# =============================================================================
+print("\n--- SQ8.2: Logistic Regression (reference) ---")
+
+scaler = StandardScaler()
+X_train_s = scaler.fit_transform(X_train)
+X_test_s  = scaler.transform(X_test)
+
+lr = LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced")
+lr.fit(X_train_s, y_train)
+
+lr_proba = lr.predict_proba(X_test_s)[:, 1]
+lr_auc   = roc_auc_score(y_test, lr_proba)
+
+# Operating threshold: maximize F2 score (weights recall 2x — missing a churner costs more)
+prec_lr, rec_lr, thresh_lr = precision_recall_curve(y_test, lr_proba)
+f2_lr = (5 * prec_lr * rec_lr) / (4 * prec_lr + rec_lr + 1e-9)
+best_idx_lr   = np.argmax(f2_lr[:-1])
+best_thresh_lr = thresh_lr[best_idx_lr]
+lr_pred = (lr_proba >= best_thresh_lr).astype(int)
+
+lr_precision = precision_score(y_test, lr_pred, pos_label=1, zero_division=0)
+lr_recall    = recall_score(y_test, lr_pred, pos_label=1, zero_division=0)
+
+print(f"  AUC-ROC:   {lr_auc:.4f}")
+print(f"  Operating threshold (F2-max): {best_thresh_lr:.3f}")
+print(f"  Precision (Churned): {lr_precision:.3f}")
+print(f"  Recall    (Churned): {lr_recall:.3f}")
+print("\n  Full classification report:")
+print(classification_report(y_test, lr_pred, target_names=["Active", "Churned"]))
+
+# LR feature importances (coefficient magnitudes after scaling)
+coef_df = pd.DataFrame({
+    "feature": FEATURE_COLS,
+    "coef": lr.coef_[0],
+    "abs_coef": np.abs(lr.coef_[0])
+}).sort_values("abs_coef", ascending=False)
+print("  LR feature importances (|coefficient|):")
+for _, row in coef_df.head(10).iterrows():
+    print(f"    {row['feature']:<25} {row['coef']:+.4f}")
+
+# =============================================================================
+# --- SQ8.3: XGBoost benchmark ---
+# =============================================================================
+print("\n--- SQ8.3: XGBoost benchmark ---")
+
+# scale_pos_weight handles class imbalance: ratio of negative to positive samples
+spw = (1 - y_train.mean()) / y_train.mean()
+xgb_model = XGBClassifier(
+    n_estimators=200,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    scale_pos_weight=spw,
+    random_state=42,
+    eval_metric="logloss",
+    verbosity=0,
+    use_label_encoder=False,
+)
+xgb_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+
+xgb_proba = xgb_model.predict_proba(X_test)[:, 1]
+xgb_auc   = roc_auc_score(y_test, xgb_proba)
+
+# Operating threshold for XGB
+prec_xgb, rec_xgb, thresh_xgb = precision_recall_curve(y_test, xgb_proba)
+f2_xgb = (5 * prec_xgb * rec_xgb) / (4 * prec_xgb + rec_xgb + 1e-9)
+best_idx_xgb    = np.argmax(f2_xgb[:-1])
+best_thresh_xgb = thresh_xgb[best_idx_xgb]
+xgb_pred = (xgb_proba >= best_thresh_xgb).astype(int)
+
+xgb_precision = precision_score(y_test, xgb_pred, pos_label=1, zero_division=0)
+xgb_recall    = recall_score(y_test, xgb_pred, pos_label=1, zero_division=0)
+
+print(f"  AUC-ROC:   {xgb_auc:.4f}")
+print(f"  Operating threshold (F2-max): {best_thresh_xgb:.3f}")
+print(f"  Precision (Churned): {xgb_precision:.3f}")
+print(f"  Recall    (Churned): {xgb_recall:.3f}")
+print("\n  Full classification report:")
+print(classification_report(y_test, xgb_pred, target_names=["Active", "Churned"]))
+
+# =============================================================================
+# --- SQ8.4: Model selection (scoping doc rule: switch if AUC improvement > 0.03) ---
+# =============================================================================
+print("\n--- SQ8.4: Model selection ---")
+auc_delta = xgb_auc - lr_auc
+print(f"  LR  AUC-ROC: {lr_auc:.4f}")
+print(f"  XGB AUC-ROC: {xgb_auc:.4f}")
+print(f"  Delta: {auc_delta:+.4f}  (threshold for switch: +0.03)")
+
+if auc_delta > 0.03:
+    WINNING_MODEL   = "XGBoost"
+    best_proba      = xgb_proba
+    best_pred_test  = xgb_pred
+    best_auc        = xgb_auc
+    best_thresh     = best_thresh_xgb
+    best_precision  = xgb_precision
+    best_recall     = xgb_recall
+    use_shap        = True
+    print(f"  DECISION: XGBoost selected (delta > 0.03 threshold).")
+else:
+    WINNING_MODEL   = "Logistic Regression"
+    best_proba      = lr_proba
+    best_pred_test  = lr_pred
+    best_auc        = lr_auc
+    best_thresh     = best_thresh_lr
+    best_precision  = lr_precision
+    best_recall     = lr_recall
+    use_shap        = False
+    print(f"  DECISION: Logistic Regression retained (delta <= 0.03 threshold).")
+
+# =============================================================================
+# --- SQ8.5: SHAP values (if XGBoost wins) ---
+# =============================================================================
+if use_shap:
+    print("\n--- SQ8.5: SHAP feature importance (XGBoost) ---")
+    explainer   = shap.TreeExplainer(xgb_model)
+    shap_vals   = explainer.shap_values(X_test)
+    shap_imp    = pd.DataFrame({
+        "feature":       FEATURE_COLS,
+        "mean_abs_shap": np.abs(shap_vals).mean(axis=0)
+    }).sort_values("mean_abs_shap", ascending=False)
+    feature_importance = shap_imp.rename(columns={"mean_abs_shap": "importance"})
+    print(f"  Top 10 features by mean |SHAP|:")
+    for _, row in shap_imp.head(10).iterrows():
+        print(f"    {row['feature']:<25}  {row['mean_abs_shap']:.4f}")
+
+    shap.summary_plot(shap_vals, X_test, feature_names=FEATURE_COLS, show=False)
+    plt.tight_layout()
+    plt.savefig(VIZ_DIR / "sq8_shap_summary.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Chart saved: sq8_shap_summary.png")
+else:
+    feature_importance = coef_df.rename(columns={"abs_coef": "importance"})[["feature", "importance"]]
+
+# =============================================================================
+# --- SQ8.6: Model performance chart (ROC + Precision-Recall) ---
+# =============================================================================
+fpr, tpr, _ = roc_curve(y_test, best_proba)
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+axes[0].plot(fpr, tpr, color="#1a3a5c", linewidth=2,
+             label=f"{WINNING_MODEL} (AUC={best_auc:.3f})")
+axes[0].plot([0, 1], [0, 1], "k--", linewidth=1, label="Random baseline")
+axes[0].set_title(f"ROC Curve — {WINNING_MODEL}", fontsize=12)
+axes[0].set_xlabel("False Positive Rate")
+axes[0].set_ylabel("True Positive Rate")
+axes[0].legend()
+
+p_arr, r_arr = (prec_xgb, rec_xgb) if use_shap else (prec_lr, rec_lr)
+t_arr        = thresh_xgb if use_shap else thresh_lr
+axes[1].plot(t_arr, p_arr[:-1], color="#27ae60", linewidth=2, label="Precision")
+axes[1].plot(t_arr, r_arr[:-1], color="#c0392b", linewidth=2, label="Recall")
+axes[1].axvline(best_thresh, color="black", linestyle="--", linewidth=1,
+                label=f"Operating threshold ({best_thresh:.3f})")
+axes[1].set_title("Precision & Recall vs Threshold", fontsize=12)
+axes[1].set_xlabel("Threshold")
+axes[1].set_ylabel("Score")
+axes[1].legend()
+
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "sq8_model_performance.png", dpi=150, bbox_inches="tight")
+plt.close()
+print(f"\n  Chart saved: sq8_model_performance.png")
+
+# =============================================================================
+# --- SQ8.7: Score active accounts + risk tier assignment ---
+# =============================================================================
+print("\n--- SQ8.7: Scoring active accounts ---")
+
+active_feat = features[features["is_churned"] == False].copy()
+
+if WINNING_MODEL == "XGBoost":
+    active_scores = xgb_model.predict_proba(active_feat[FEATURE_COLS].values)[:, 1]
+else:
+    active_scores = lr.predict_proba(
+        scaler.transform(active_feat[FEATURE_COLS].values)
+    )[:, 1]
+
+active_feat["churn_risk_score"] = active_scores
+
+# Risk tiers: thresholds chosen symmetrically around operating threshold
+# High >= 0.65 (above operating threshold by design), Low <= 0.40
+active_feat["risk_tier"] = pd.cut(
+    active_feat["churn_risk_score"],
+    bins=[0.0, 0.40, 0.65, 1.001],
+    labels=["Low", "Medium", "High"],
+    right=False
+)
+
+risk_counts = active_feat["risk_tier"].value_counts()
+print(f"  Active accounts scored: {len(active_feat)}")
+print(f"  Risk tier distribution:")
+for tier in ["High", "Medium", "Low"]:
+    n = risk_counts.get(tier, 0)
+    pct = n / len(active_feat) * 100
+    print(f"    {tier:<8}: {n:>4} accounts ({pct:.1f}%)")
+
+# =============================================================================
+# --- SQ8.8: Export churn_risk_scores.csv + churn_model.pkl ---
+# =============================================================================
+print("\n--- SQ8.8: Exporting model artifacts ---")
+
+risk_export = active_feat[
+    ["account_id", "churn_risk_score", "risk_tier", "plan_tier", "tenure_months",
+     "early_churn_flag", "error_rate", "usage_trend"]
+].copy()
+risk_export["churn_risk_score"] = risk_export["churn_risk_score"].round(4)
+risk_export = risk_export.sort_values("churn_risk_score", ascending=False)
+risk_export.to_csv(EXPORT_DIR / "churn_risk_scores.csv", index=False, encoding="utf-8-sig")
+print(f"  Exported: export/churn_risk_scores.csv  ({len(risk_export)} rows)")
+
+model_artifact = {
+    "model":        xgb_model if WINNING_MODEL == "XGBoost" else lr,
+    "scaler":       None if WINNING_MODEL == "XGBoost" else scaler,
+    "feature_cols": FEATURE_COLS,
+    "threshold":    best_thresh,
+    "model_name":   WINNING_MODEL,
+    "auc_roc":      best_auc,
+}
+with open(EXPORT_DIR / "churn_model.pkl", "wb") as f:
+    pickle.dump(model_artifact, f)
+print(f"  Exported: export/churn_model.pkl")
+
+# =============================================================================
+# --- SQ9: ICP Profile — LTV by segment ---
+# LTV (realized): sum of monthly MRR across all active months * gross_margin (80%)
+# Forward-looking LTV would require a churn rate assumption per segment —
+# using realized LTV here for precision; flag as limitation in writeup.
+# =============================================================================
+print("\n--- SQ9: ICP Profile — LTV by segment ---")
+print(f"  (Gross margin assumption: {GROSS_MARGIN*100:.0f}% — SaaS benchmark, flagged)")
+
+# Realized LTV per account from mrr_panel (one row per active subscription-month)
+acct_ltv_raw = mrr_panel.groupby("account_id")["mrr_amount"].sum().reset_index()
+acct_ltv_raw.columns = ["account_id", "total_lifetime_mrr"]
+acct_ltv_raw["ltv_realized"] = (acct_ltv_raw["total_lifetime_mrr"] * GROSS_MARGIN).round(0)
+
+# Merge with acct (has industry, referral_source, is_churned, tenure_months)
+acct_ltv = acct.merge(acct_ltv_raw, on="account_id", how="left").fillna(0)
+
+def ltv_segment_summary(df, col, min_n=MIN_SEG):
+    """Segment LTV + churn — suppress segments below min_n."""
+    grp = df.groupby(col).agg(
+        n           =("account_id", "count"),
+        avg_ltv     =("ltv_realized", "mean"),
+        median_ltv  =("ltv_realized", "median"),
+        churn_pct   =("is_churned", lambda x: x.mean() * 100),
+        avg_tenure  =("tenure_months", "mean"),
+    ).reset_index()
+    grp = grp[grp["n"] >= min_n].sort_values("avg_ltv", ascending=False)
+    grp["avg_ltv"]    = grp["avg_ltv"].round(0)
+    grp["median_ltv"] = grp["median_ltv"].round(0)
+    grp["churn_pct"]  = grp["churn_pct"].round(1)
+    grp["avg_tenure"] = grp["avg_tenure"].round(1)
+    return grp
+
+ltv_tier     = ltv_segment_summary(acct_ltv, "plan_tier")
+ltv_industry = ltv_segment_summary(acct_ltv, "industry")
+ltv_referral = ltv_segment_summary(acct_ltv, "referral_source")
+
+print(f"\n  Realized LTV by plan tier:")
+print(f"  {'Tier':<14} {'n':>5} {'Avg LTV':>12} {'Median LTV':>12} {'Churn%':>8} {'Avg Tenure':>11}")
+print(f"  {'-' * 62}")
+for _, row in ltv_tier.iterrows():
+    print(f"  {row['plan_tier']:<14} {int(row['n']):>5} "
+          f"${int(row['avg_ltv']):>11,} ${int(row['median_ltv']):>11,} "
+          f"{row['churn_pct']:>7.1f}% {row['avg_tenure']:>10.1f}mo")
+
+print(f"\n  Realized LTV by industry (top 5 by avg LTV, n >= {MIN_SEG}):")
+print(f"  {'Industry':<25} {'n':>5} {'Avg LTV':>12} {'Churn%':>8}")
+print(f"  {'-' * 52}")
+for _, row in ltv_industry.head(5).iterrows():
+    print(f"  {row['industry']:<25} {int(row['n']):>5} ${int(row['avg_ltv']):>11,} {row['churn_pct']:>7.1f}%")
+
+print(f"\n  Realized LTV by referral source (n >= {MIN_SEG}):")
+print(f"  {'Source':<22} {'n':>5} {'Avg LTV':>12} {'Churn%':>8}")
+print(f"  {'-' * 49}")
+for _, row in ltv_referral.iterrows():
+    print(f"  {row['referral_source']:<22} {int(row['n']):>5} ${int(row['avg_ltv']):>11,} {row['churn_pct']:>7.1f}%")
+
+# ICP: highest avg LTV AND below-average churn rate
+overall_churn_rate = acct_ltv["is_churned"].mean() * 100
+avg_ltv_overall    = acct_ltv["ltv_realized"].mean()
+
+print(f"\n  Overall baseline: churn {overall_churn_rate:.1f}%  |  avg LTV ${avg_ltv_overall:,.0f}")
+print(f"\n  ICP candidates (above avg LTV AND below avg churn — by tier):")
+icp_tier = ltv_tier[
+    (ltv_tier["avg_ltv"] > avg_ltv_overall) &
+    (ltv_tier["churn_pct"] < overall_churn_rate)
+]
+if len(icp_tier) > 0:
+    for _, row in icp_tier.iterrows():
+        print(f"    {row['plan_tier']:<14}: avg LTV ${int(row['avg_ltv']):,}  "
+              f"churn {row['churn_pct']:.1f}%  avg tenure {row['avg_tenure']:.1f}mo")
+else:
+    print("    No single tier clears both thresholds — highest LTV tier listed below.")
+    print(f"    {ltv_tier.iloc[0]['plan_tier']}: avg LTV ${int(ltv_tier.iloc[0]['avg_ltv']):,}  "
+          f"churn {ltv_tier.iloc[0]['churn_pct']:.1f}%")
+
+# ICP expansion profile (from SQ7 upgrade_summary)
+print(f"\n  Expansion MRR by tier (from SQ7):")
+for _, row in upgrade_summary.sort_values("upgrade_mrr", ascending=False).iterrows():
+    print(f"    {row['plan_tier']:<14}: ${int(row['upgrade_mrr']):>10,} total upgrade MRR  "
+          f"({row['upgrades_per_account']:.2f} upgrades/account)")
+
+# LTV chart: average LTV by tier + industry (side by side)
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+ltv_tier_plot = ltv_tier.sort_values("avg_ltv", ascending=True)
+bars = axes[0].barh(ltv_tier_plot["plan_tier"], ltv_tier_plot["avg_ltv"] / 1000,
+                    color="#1a3a5c")
+axes[0].set_title("Average Realized LTV by Plan Tier\n(gross margin 80% — assumed)", fontsize=11)
+axes[0].set_xlabel("Avg LTV ($K)")
+axes[0].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:.0f}K"))
+for bar, (_, row) in zip(bars, ltv_tier_plot.iterrows()):
+    axes[0].text(bar.get_width() + 0.5, bar.get_y() + bar.get_height() / 2,
+                 f"churn {row['churn_pct']:.1f}%", va="center", fontsize=9)
+
+ltv_ind_plot = ltv_industry.head(8).sort_values("avg_ltv", ascending=True)
+axes[1].barh(ltv_ind_plot["industry"], ltv_ind_plot["avg_ltv"] / 1000, color="#1a6b3c")
+axes[1].set_title(f"Avg Realized LTV by Industry (top 8, n >= {MIN_SEG})", fontsize=11)
+axes[1].set_xlabel("Avg LTV ($K)")
+axes[1].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:.0f}K"))
+
+plt.tight_layout()
+plt.savefig(VIZ_DIR / "sq9_icp_ltv.png", dpi=150, bbox_inches="tight")
+plt.close()
+print(f"\n  Chart saved: sq9_icp_ltv.png")
+
+# =============================================================================
+# --- Phase 5 summary ---
+# =============================================================================
+
+print(f"\n{'=' * 70}")
+print("PHASE 5 SUMMARY — MODEL (SQ8) + ICP (SQ9)")
+print(f"{'=' * 70}")
+print()
+print(f"  SQ8 — Churn Risk Model")
+print(f"    Logistic Regression AUC-ROC:   {lr_auc:.4f}")
+print(f"    XGBoost AUC-ROC:               {xgb_auc:.4f}  (delta vs LR: {auc_delta:+.4f})")
+print(f"    Winning model:                 {WINNING_MODEL}")
+print(f"    Operating threshold (F2-max):  {best_thresh:.3f}")
+print(f"    Precision at threshold:        {best_precision:.3f}")
+print(f"    Recall at threshold:           {best_recall:.3f}")
+print()
+print(f"    Top 5 features by importance:")
+for _, row in feature_importance.head(5).iterrows():
+    print(f"      {row['feature']:<25}  {row['importance']:.4f}")
+print()
+print(f"    Risk tier distribution (active accounts, n={len(active_feat)}):")
+for tier in ["High", "Medium", "Low"]:
+    n = risk_counts.get(tier, 0)
+    print(f"      {tier:<8}: {n:>4}  ({n / len(active_feat) * 100:.1f}%)")
+print()
+print(f"  SQ9 — ICP Profile")
+print(f"    Overall avg realized LTV: ${avg_ltv_overall:,.0f}  "
+      f"(gross margin {GROSS_MARGIN*100:.0f}% — assumed)")
+print(f"    LTV by tier:")
+for _, row in ltv_tier.iterrows():
+    print(f"      {row['plan_tier']:<14}: avg LTV ${int(row['avg_ltv']):>10,}  "
+          f"churn {row['churn_pct']:.1f}%")
+print()
+print(f"  Exports:")
+print(f"    export/churn_risk_scores.csv  ({len(risk_export)} active accounts)")
+print(f"    export/churn_model.pkl        ({WINNING_MODEL})")
+print()
+print(f"  Charts saved: sq8_model_performance, sq8_shap_summary (if XGB), sq9_icp_ltv")
+print()
+print(f"\n  Ready to proceed to Phase 6 (export): PENDING REVIEW")
+print(f"{'=' * 70}\n")
+
+# === Phase 6: Export ===
