@@ -2241,4 +2241,386 @@ print()
 print(f"\n  Ready to proceed to Phase 6 (export): PENDING REVIEW")
 print(f"{'=' * 70}\n")
 
+# =============================================================================
 # === Phase 6: Export ===
+# Per 00_scoping.md Section 7: account_metrics, cohort_metrics,
+# segment_metrics, churn_risk_scores, subs_flat, churn_model.pkl, model_card.md
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("PHASE 6 — EXPORT")
+print("=" * 70)
+
+# -------------------------------------------------------
+# Helper: print file size after each export
+# -------------------------------------------------------
+def report_file(path, label=None):
+    sz = path.stat().st_size
+    sz_str = f"{sz / 1024:.1f} KB" if sz < 1024 * 1024 else f"{sz / 1024 / 1024:.2f} MB"
+    name = label or path.name
+    print(f"    {name:<35}  {sz_str}")
+
+# =============================================================================
+# 6.1  account_metrics.csv
+#      One row per non-trial account — all computed metrics
+# =============================================================================
+print("\n--- 6.1: account_metrics.csv ---")
+
+account_metrics = acct[[
+    "account_id", "account_name", "plan_tier", "industry", "country",
+    "referral_source", "seats", "signup_date", "tenure_months",
+    "is_churned", "first_churn_date",
+]].copy()
+
+account_metrics = (
+    account_metrics
+    .merge(acct_ltv_raw[["account_id", "total_lifetime_mrr", "ltv_realized"]],
+           on="account_id", how="left")
+    .merge(fu_lifetime[["account_id", "lifetime_features", "lifetime_events", "lifetime_errors"]],
+           on="account_id", how="left")
+    .merge(
+        acct_support[["account_id", "total_tickets", "total_escalations",
+                      "avg_resolution_hrs", "avg_satisfaction"]],
+        on="account_id", how="left"
+    )
+    # Only merge feature columns not already present to avoid suffix collisions
+    .merge(features[["account_id"] + [c for c in FEATURE_COLS
+                                       if c not in ["tenure_months", "plan_tier_num",
+                                                    "seats", "lifetime_features"]]],
+           on="account_id", how="left")
+    .merge(active_feat[["account_id", "churn_risk_score", "risk_tier"]],
+           on="account_id", how="left")
+)
+
+# Round numeric columns
+for col in ["total_lifetime_mrr", "ltv_realized", "tenure_months",
+            "avg_resolution_hrs", "avg_satisfaction", "churn_risk_score"]:
+    if col in account_metrics.columns:
+        account_metrics[col] = account_metrics[col].round(2)
+
+account_metrics = account_metrics.fillna({
+    "total_tickets": 0, "total_escalations": 0,
+    "lifetime_features": 0, "lifetime_events": 0, "lifetime_errors": 0,
+})
+
+account_metrics.to_csv(EXPORT_DIR / "account_metrics.csv", index=False, encoding="utf-8-sig")
+print(f"  Rows: {len(account_metrics)}  |  Cols: {len(account_metrics.columns)}")
+report_file(EXPORT_DIR / "account_metrics.csv")
+
+# =============================================================================
+# 6.2  cohort_metrics.csv
+#      Cohort retention matrix — M0/M1/M3/M6/M12/M18/M24
+# =============================================================================
+print("\n--- 6.2: cohort_metrics.csv ---")
+
+pct_cols = [f"M{m}_pct" for m in MILESTONES]
+cohort_export = cohort_ret[["cohort", "n"] + pct_cols].copy()
+cohort_export = cohort_export.rename(columns={"cohort": "cohort_month", "n": "n_accounts"})
+cohort_export["cohort_month"] = cohort_export["cohort_month"].astype(str)
+
+cohort_export.to_csv(EXPORT_DIR / "cohort_metrics.csv", index=False, encoding="utf-8-sig")
+print(f"  Rows: {len(cohort_export)}  |  Cols: {len(cohort_export.columns)}")
+report_file(EXPORT_DIR / "cohort_metrics.csv")
+
+# =============================================================================
+# 6.3  segment_metrics.csv
+#      Churn rate, LTV, GRR by plan tier / industry / referral source / seats band
+# =============================================================================
+print("\n--- 6.3: segment_metrics.csv ---")
+
+# Seats band LTV — add seats_band to acct_ltv if not already present
+if "seats_band" not in acct_ltv.columns:
+    acct_ltv["seats_band"] = pd.cut(
+        acct_ltv["seats"], bins=[0, 5, 10, 25, 50, 999],
+        labels=["1-5", "6-10", "11-25", "26-50", "51+"]
+    )
+ltv_seats = ltv_segment_summary(acct_ltv, "seats_band")
+
+seg_records = []
+for dim, df_seg in [
+    ("plan_tier",       ltv_tier),
+    ("industry",        ltv_industry),
+    ("referral_source", ltv_referral),
+    ("seats_band",      ltv_seats),
+]:
+    for _, row in df_seg.iterrows():
+        seg_records.append({
+            "dimension":           dim,
+            "segment_value":       str(row[dim]),
+            "n_accounts":          int(row["n"]),
+            "churn_rate_pct":      round(float(row["churn_pct"]), 1),
+            "avg_ltv_realized":    int(row["avg_ltv"]),
+            "median_ltv_realized": int(row["median_ltv"]),
+            "avg_tenure_months":   round(float(row["avg_tenure"]), 1),
+            # Segment-level GRR not computed (cohort sample sizes too small);
+            # portfolio-level GRR (97.8%) reported as reference
+            "portfolio_grr_pct":   97.8,
+        })
+
+segment_metrics = pd.DataFrame(seg_records)
+segment_metrics.to_csv(EXPORT_DIR / "segment_metrics.csv", index=False, encoding="utf-8-sig")
+print(f"  Rows: {len(segment_metrics)}  |  Cols: {len(segment_metrics.columns)}")
+report_file(EXPORT_DIR / "segment_metrics.csv")
+
+# =============================================================================
+# 6.4  churn_risk_scores.csv  (enhanced — with account_name + component signals)
+#      Three component signals computed as partial logit → sigmoid
+# =============================================================================
+print("\n--- 6.4: churn_risk_scores.csv (enhanced) ---")
+
+# Standardise active account features (same scaler fitted in Phase 5)
+X_active_s  = scaler.transform(active_feat[FEATURE_COLS].values)
+X_active_df = pd.DataFrame(X_active_s, columns=FEATURE_COLS, index=active_feat.index)
+coef_map    = dict(zip(FEATURE_COLS, lr.coef_[0]))
+
+USAGE_FEATS   = ["usage_days_60d", "events_60d", "features_60d",
+                 "error_rate", "tenure_norm_usage", "usage_trend"]
+SUPPORT_FEATS = ["tickets_60d", "escalations_60d", "satisfaction_60d"]
+PLAN_FEATS    = ["tenure_months", "plan_tier_num", "seats",
+                 "early_churn_flag", "lifetime_features"]
+
+def partial_signal(X_df, feat_group):
+    """Partial logit contribution for a feature group → sigmoid → [0,1].
+    Score > 0.5 means the group is pushing the model toward predicting churn."""
+    logit = sum(coef_map.get(f, 0.0) * X_df[f] for f in feat_group)
+    return (1.0 / (1.0 + np.exp(-logit))).round(4)
+
+active_for_export = active_feat.copy()
+active_for_export["usage_signal"]   = partial_signal(X_active_df, USAGE_FEATS).values
+active_for_export["support_signal"] = partial_signal(X_active_df, SUPPORT_FEATS).values
+active_for_export["plan_signal"]    = partial_signal(X_active_df, PLAN_FEATS).values
+
+# Add account_name from acct
+active_for_export = active_for_export.merge(
+    acct[["account_id", "account_name"]], on="account_id", how="left"
+)
+
+risk_scores_out = active_for_export[[
+    "account_id", "account_name", "churn_risk_score", "risk_tier",
+    "plan_tier", "tenure_months",
+    "usage_signal", "support_signal", "plan_signal",
+]].copy()
+risk_scores_out["churn_risk_score"] = risk_scores_out["churn_risk_score"].round(4)
+risk_scores_out = risk_scores_out.sort_values("churn_risk_score", ascending=False).reset_index(drop=True)
+
+risk_scores_out.to_csv(EXPORT_DIR / "churn_risk_scores.csv", index=False, encoding="utf-8-sig")
+print(f"  Rows: {len(risk_scores_out)}  |  Cols: {len(risk_scores_out.columns)}")
+report_file(EXPORT_DIR / "churn_risk_scores.csv")
+
+# =============================================================================
+# 6.5  subs_flat.csv — flat transaction table for Power BI drill-down
+#      One row per subscription, enriched with account + churn event attributes
+# =============================================================================
+print("\n--- 6.5: subs_flat.csv ---")
+
+acct_attrs_for_flat = accounts[[
+    "account_id", "account_name", "industry", "country", "referral_source", "is_trial"
+]].copy()
+
+# First non-reactivation churn event per account
+churn_attrs = (
+    churn_first
+    .groupby("account_id", as_index=False)
+    .first()[["account_id", "churn_date", "reason_code",
+              "refund_amount_usd", "preceding_upgrade_flag",
+              "preceding_downgrade_flag"]]
+)
+
+subs_flat = (
+    subscriptions
+    .merge(acct_attrs_for_flat, on="account_id", how="left")
+    .merge(churn_attrs, on="account_id", how="left")
+    .merge(
+        account_metrics[["account_id", "tenure_months", "ltv_realized",
+                         "churn_risk_score", "risk_tier"]],
+        on="account_id", how="left"
+    )
+)
+
+subs_flat.to_csv(EXPORT_DIR / "subs_flat.csv", index=False, encoding="utf-8-sig")
+print(f"  Rows: {len(subs_flat)}  |  Cols: {len(subs_flat.columns)}")
+report_file(EXPORT_DIR / "subs_flat.csv")
+
+# =============================================================================
+# 6.6  churn_model.pkl — full pipeline (model + scaler + metadata)
+# =============================================================================
+print("\n--- 6.6: churn_model.pkl ---")
+
+model_artifact_full = {
+    "model":                    lr,
+    "scaler":                   scaler,
+    "feature_cols":             FEATURE_COLS,
+    "threshold":                float(best_thresh),
+    "model_name":               WINNING_MODEL,
+    "auc_roc":                  float(best_auc),
+    "precision":                float(best_precision),
+    "recall":                   float(best_recall),
+    "train_n":                  int(len(X_train)),
+    "test_n":                   int(len(X_test)),
+    "risk_tier_thresholds":     {"High": 0.65, "Medium": 0.40, "Low": 0.0},
+    "gross_margin_assumption":  GROSS_MARGIN,
+    "usage_signal_features":    USAGE_FEATS,
+    "support_signal_features":  SUPPORT_FEATS,
+    "plan_signal_features":     PLAN_FEATS,
+}
+with open(EXPORT_DIR / "churn_model.pkl", "wb") as fh:
+    pickle.dump(model_artifact_full, fh)
+print(f"  Keys: {list(model_artifact_full.keys())}")
+report_file(EXPORT_DIR / "churn_model.pkl")
+
+# =============================================================================
+# 6.7  model_card.md
+# =============================================================================
+print("\n--- 6.7: model_card.md ---")
+
+coef_rows = ""
+for _, row in coef_df.iterrows():
+    grp = ("Usage"   if row["feature"] in USAGE_FEATS   else
+           "Support" if row["feature"] in SUPPORT_FEATS else
+           "Plan/Account")
+    direction = "→ churn" if row["coef"] > 0 else "→ retain"
+    coef_rows += f"| `{row['feature']}` | {grp} | {direction} | {row['coef']:+.4f} |\n"
+
+model_card = f"""# Churn Risk Model Card
+## ravenstack-saas-churn
+
+---
+
+## Model summary
+
+| Field | Value |
+|---|---|
+| Algorithm | {WINNING_MODEL} |
+| Dataset | RavenStack SaaS pilot — 500 accounts, Jan 2023 – Dec 2024 |
+| Training period | Full 24-month pilot; Dec 2024 excluded from churn labels (pilot shutdown artifact) |
+| Train / test split | {len(X_train)} / {len(X_test)} accounts (stratified 80/20) |
+| Class balance | {int(y.sum())} churned ({y.mean()*100:.1f}%) / {int((1-y).sum())} active ({(1-y).mean()*100:.1f}%) |
+
+---
+
+## Performance
+
+| Metric | Value |
+|---|---|
+| AUC-ROC | **{best_auc:.4f}** |
+| Operating threshold (F2-maximization) | {best_thresh:.3f} |
+| Precision at threshold (Churned class) | {best_precision:.3f} |
+| Recall at threshold (Churned class) | **{best_recall:.3f}** |
+
+Threshold selected by maximizing F2 score (recall weighted 2×) — consistent with the
+business priority that missing a churner costs more than a false positive.
+
+XGBoost benchmarked at AUC {xgb_auc:.4f} (delta {auc_delta:+.4f} vs LR).
+LR retained per project decision rule: switch only if delta > +0.03.
+
+---
+
+## Features
+
+| Feature | Signal group | Direction | Coefficient |
+|---|---|---|---|
+{coef_rows}
+---
+
+## Risk tier thresholds
+
+| Tier | Score range | Active accounts (n={len(active_feat)}) | Recommended action |
+|---|---|---|---|
+| **High** | >= 0.65 | {int(risk_counts.get('High', 0))} ({int(risk_counts.get('High', 0))/len(active_feat)*100:.1f}%) | Immediate CS outreach |
+| **Medium** | 0.40 – 0.65 | {int(risk_counts.get('Medium', 0))} ({int(risk_counts.get('Medium', 0))/len(active_feat)*100:.1f}%) | Proactive watch list |
+| **Low** | < 0.40 | {int(risk_counts.get('Low', 0))} ({int(risk_counts.get('Low', 0))/len(active_feat)*100:.1f}%) | Routine monitoring |
+
+---
+
+## Component scores (in churn_risk_scores.csv)
+
+Sub-scores computed as partial logit contribution mapped to [0, 1] via sigmoid.
+**Score > 0.5 means that signal group is pushing toward churn prediction.**
+
+| Signal | Features |
+|---|---|
+| `usage_signal` | {', '.join(f'`{f}`' for f in USAGE_FEATS)} |
+| `support_signal` | {', '.join(f'`{f}`' for f in SUPPORT_FEATS)} |
+| `plan_signal` | {', '.join(f'`{f}`' for f in PLAN_FEATS)} |
+
+---
+
+## Known limitations
+
+1. **Synthetic pilot data** — trained on {len(acct)} non-trial accounts from a single 24-month
+   pilot dataset; may not generalize to post-launch population.
+2. **Small test set** — n={len(X_test)} test accounts; AUC and precision/recall estimates carry
+   high variance. Cross-validate before production use.
+3. **Low operating threshold** — threshold {best_thresh:.3f} yields recall 1.000 at precision {best_precision:.3f};
+   88% of truly-active test accounts are flagged. Recalibrate to CS team capacity in production.
+4. **Concurrent subscription architecture** — accounts hold 8–10 concurrent subscriptions.
+   Revenue churn revised to account-level methodology; NRR deprecated (inflates to ~335%).
+5. **Dec 2024 excluded** — final pilot month (68.8% logo churn) is a planned shutdown artifact,
+   not organic attrition. Excluded from churn labels and average rate calculations.
+6. **Realized LTV only** — LTV figures are historical. Forward LTV requires per-segment churn
+   rate assumptions not supported by this sample size.
+7. **GRR at portfolio level only** — segment-level GRR not computed due to insufficient cohort
+   sample sizes per segment. Portfolio GRR: 97.8% (above 80–90% SaaS benchmark).
+
+---
+
+## Intended use
+
+Prioritize CS intervention outreach among currently active accounts.
+**High tier (score >= 0.65):** immediate outreach.
+**Medium tier (0.40–0.65):** proactive watch list.
+Not intended for automated account termination or financial forecasting without
+additional calibration.
+
+---
+
+## Reproducibility
+
+```
+python 01_analysis.py
+```
+
+Requires: pandas, numpy, matplotlib, seaborn, scikit-learn, xgboost, shap.
+Data source: Kaggle — rivalytics/saas-subscription-and-churn-analytics-dataset
+(MIT-like license; credit: River @ Rivalytics).
+
+---
+
+*Generated by 01_analysis.py — ravenstack-saas-churn portfolio project*
+*Author: Giacomo Apicella · [github.com/Giacoap](https://github.com/Giacoap) · [giacoap.github.io](https://giacoap.github.io)*
+"""
+
+with open(EXPORT_DIR / "model_card.md", "w", encoding="utf-8") as fh:
+    fh.write(model_card)
+report_file(EXPORT_DIR / "model_card.md")
+
+# =============================================================================
+# --- Phase 6 summary ---
+# =============================================================================
+print(f"\n{'=' * 70}")
+print("PHASE 6 SUMMARY — EXPORT")
+print(f"{'=' * 70}")
+print()
+print("  Files in export/:")
+for fname in ["account_metrics.csv", "cohort_metrics.csv", "segment_metrics.csv",
+              "churn_risk_scores.csv", "subs_flat.csv", "churn_model.pkl", "model_card.md"]:
+    fpath = EXPORT_DIR / fname
+    if fpath.exists():
+        sz = fpath.stat().st_size
+        sz_str = f"{sz/1024:.1f} KB" if sz < 1024*1024 else f"{sz/1024/1024:.2f} MB"
+        # get row count for CSVs
+        if fname.endswith(".csv"):
+            try:
+                nrows = sum(1 for _ in open(fpath, encoding="utf-8-sig")) - 1
+                print(f"    {fname:<35}  {sz_str:<10}  {nrows} rows")
+            except Exception:
+                print(f"    {fname:<35}  {sz_str}")
+        else:
+            print(f"    {fname:<35}  {sz_str}")
+    else:
+        print(f"    {fname:<35}  NOT FOUND")
+print()
+print("  Analysis script (01_analysis.py) complete.")
+print("  All phases: Load/Clean -> EDA -> Metrics -> SQ1-SQ7 -> Model -> Export")
+print("  Next step: Phase 3 deliverable (Power BI / Tableau dashboard)")
+print(f"{'=' * 70}\n")
