@@ -19,3 +19,4 @@ venv/
 
 # Tableau workbooks locales (no comiteamos versiones intermedias)
 *.twbx.bak
+CLAUDE.md
